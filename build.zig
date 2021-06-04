@@ -12,13 +12,18 @@ pub fn build(b: *std.build.Builder) void {
     const mode = b.standardReleaseOptions();
 
     const exe = b.addExecutable("ziglearn", "src/main.zig");
+
     exe.linkLibC();
     exe.linkSystemLibrary("glfw");
     exe.linkSystemLibrary("vulkan");
+
     exe.linkSystemLibrary("c++");
     exe.addLibPath("vendor/lib/shaderc");
     exe.linkSystemLibrary("shaderc_combined");
     exe.addIncludeDir("vendor/include/");
+
+    exe.addPackagePath("zalgebra", "./deps/zalgebra/src/main.zig");
+
     exe.setTarget(target);
     exe.setBuildMode(mode);
     exe.install();

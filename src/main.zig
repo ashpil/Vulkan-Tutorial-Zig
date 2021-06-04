@@ -1,26 +1,30 @@
 const std = @import("std");
 const shader_utils = @import("shader_utils.zig");
 
+const zalgebra = @import("zalgebra");
+const Vec2 = zalgebra.vec2;
+const Vec3 = zalgebra.vec3;
+
 const c = @cImport({
     @cDefine("GLFW_INCLUDE_VULKAN", {});
     @cInclude("GLFW/glfw3.h");
 });
 
 const VulkanError = error {
-    InstanceCreationError,
+    InstanceCreateError,
     UnavailableValidationLayers,
     NoVulkanDevices,
     NoSuitableDevices,
-    LogicalDeviceCreationFail,
-    WindowSurfaceCreationFail,
-    SwapChainCreationFail,
-    ImageViewCreationFail,
-    ShaderModuleCreationFail,
-    PipelineLayoutCreationFail,
-    RenderPassCreationFail,
-    GraphicsPipelineCreationFail,
-    FramebufferCreationFail,
-    CommandPoolCreationError,
+    LogicalDeviceCreateFail,
+    WindowSurfaceCreateFail,
+    SwapChainCreateFail,
+    ImageViewCreateFail,
+    ShaderModuleCreateFail,
+    PipelineLayoutCreateFail,
+    RenderPassCreateFail,
+    GraphicsPipelineCreateFail,
+    FramebufferCreateFail,
+    CommandPoolCreateError,
     CommandBufferAllocateError,
     CommandBufferRecordFail,
     CommandBufferRecordError,
@@ -28,6 +32,9 @@ const VulkanError = error {
     DrawCommandSubmitFail,
     SwapChainImageAcquireFail,
     SwapChainImagePresentFail,
+    VertexBufferCreateFail,
+    MemoryTypeFindFail,
+    VertexBufferMemoryAllocateFail,
 };
 
 const AllocError = std.mem.Allocator.Error;
@@ -54,6 +61,45 @@ const ptrExtensions = comptime comp: {
     break :comp extensions;
 };
 const enableValidationLayers = @import("builtin").mode == std.builtin.Mode.Debug;
+
+const Vertex = extern struct {
+    pos: Vec2,
+    color: Vec3,
+
+    fn getBindingDescription() c.VkVertexInputBindingDescription {
+        const bindingDescription = c.VkVertexInputBindingDescription {
+            .binding = 0,
+            .stride = @sizeOf(Vertex),
+            .inputRate = c.VkVertexInputRate.VK_VERTEX_INPUT_RATE_VERTEX,
+        };
+
+        return bindingDescription;
+    }
+
+    fn getAttributeDescriptions() [2]c.VkVertexInputAttributeDescription {
+        const attributeDescriptionPos = c.VkVertexInputAttributeDescription {
+            .binding = 0,
+            .location = 0,
+            .format = c.VkFormat.VK_FORMAT_R32G32_SFLOAT,
+            .offset = @bitOffsetOf(Vertex, "pos"),
+        };
+
+        const attributeDescriptionColor = c.VkVertexInputAttributeDescription {
+            .binding = 0,
+            .location = 1,
+            .format = c.VkFormat.VK_FORMAT_R32G32B32_SFLOAT,
+            .offset = @bitOffsetOf(Vertex, "color"),
+        };
+
+        return .{ attributeDescriptionPos, attributeDescriptionColor };
+    }
+};
+
+const vertices = [_]Vertex {
+    Vertex { .pos = Vec2.new(0.0, -0.5), .color = Vec3.new(1.0, 0.0, 0.0) },
+    Vertex { .pos = Vec2.new(0.5, 0.5), .color = Vec3.new(0.0, 1.0, 0.0) },
+    Vertex { .pos = Vec2.new(-0.5, 0.5), .color = Vec3.new(0.0, 0.0, 1.0) },
+};
 
 const SwapChainSupportDetails = struct {
     capabilities: c.VkSurfaceCapabilitiesKHR,
@@ -154,6 +200,9 @@ const HelloTriangleApplication = struct {
 
     framebufferResized: bool = false,
 
+    vertexBuffer: c.VkBuffer = undefined,
+    vertexBufferMemory: c.VkDeviceMemory = undefined,
+
     pub fn run(self: *HelloTriangleApplication) !void {
         self.initWindow();
         try self.initVulkan();
@@ -192,8 +241,55 @@ const HelloTriangleApplication = struct {
         try self.createGraphicsPipeline();
         try self.createFramebuffers();
         try self.createCommandPool();
+        try self.createVertexBuffer();
         try self.createCommandBuffers();
         try self.createSyncObjects();
+    }
+
+    fn createVertexBuffer(self: *HelloTriangleApplication) VulkanError!void {
+        const bufferInfo = c.VkBufferCreateInfo {
+            .sType = c.VkStructureType.VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
+            .size = @sizeOf(Vertex) * vertices.len,
+            .usage = c.VK_BUFFER_USAGE_VERTEX_BUFFER_BIT,
+            .sharingMode = c.VkSharingMode.VK_SHARING_MODE_EXCLUSIVE,
+            .queueFamilyIndexCount = 0,
+            .pQueueFamilyIndices = null,
+            .flags = 0,
+            .pNext = null,
+        };
+        if (c.vkCreateBuffer(self.device, &bufferInfo, null, &self.vertexBuffer) != c.VkResult.VK_SUCCESS) return VulkanError.VertexBufferCreateFail;
+
+        var memRequirements: c.VkMemoryRequirements = undefined;
+        c.vkGetBufferMemoryRequirements(self.device, self.vertexBuffer, &memRequirements);
+
+        const allocInfo = c.VkMemoryAllocateInfo {
+            .sType = c.VkStructureType.VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
+            .allocationSize = memRequirements.size,
+            .memoryTypeIndex = try self.findMemoryType(memRequirements.memoryTypeBits, c.VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | c.VK_MEMORY_PROPERTY_HOST_COHERENT_BIT),
+            .pNext = null,
+        };
+        if (c.vkAllocateMemory(self.device, &allocInfo, null, &self.vertexBufferMemory) != c.VkResult.VK_SUCCESS) return VulkanError.VertexBufferMemoryAllocateFail;
+        _ = c.vkBindBufferMemory(self.device, self.vertexBuffer, self.vertexBufferMemory, 0);
+
+        var data: []Vertex = undefined;
+        data.len = vertices.len;
+        _ = c.vkMapMemory(self.device, self.vertexBufferMemory, 0, bufferInfo.size, 0, @ptrCast(*?*c_void, &data.ptr));
+        std.mem.copy(Vertex, data, &vertices);
+        c.vkUnmapMemory(self.device, self.vertexBufferMemory);
+    }
+
+    fn findMemoryType(self: *HelloTriangleApplication, typeFilter: u32, properties: c.VkMemoryPropertyFlags) VulkanError!u32 {
+        var memProperties: c.VkPhysicalDeviceMemoryProperties = undefined;
+        c.vkGetPhysicalDeviceMemoryProperties(self.physicalDevice, &memProperties);
+
+        var i: u32 = 0;
+        while (i < memProperties.memoryTypeCount) : (i += 1) {
+            if (typeFilter & (@as(u32, 1) << @intCast(u5, i)) != 0 and (memProperties.memoryTypes[i].propertyFlags & properties) == properties) {
+                return i;
+            }
+        }
+
+        return VulkanError.MemoryTypeFindFail;
     }
 
     fn recreateSwapChain(self: *HelloTriangleApplication) (VulkanError || AllocError || shader_utils.CompilationError)!void {
@@ -271,7 +367,14 @@ const HelloTriangleApplication = struct {
             };
             c.vkCmdBeginRenderPass(commandBuffer, &renderPassInfo, c.VkSubpassContents.VK_SUBPASS_CONTENTS_INLINE);
             c.vkCmdBindPipeline(commandBuffer, c.VkPipelineBindPoint.VK_PIPELINE_BIND_POINT_GRAPHICS, self.graphicsPipeline);
-            c.vkCmdDraw(commandBuffer, 3, 1, 0, 0);
+
+            const vertexBuffers = [_]c.VkBuffer{ self.vertexBuffer };
+            const offsets = [_]u64{ 0 };
+
+            c.vkCmdBindVertexBuffers(commandBuffer, 0, 1, &vertexBuffers, &offsets);
+
+            c.vkCmdDraw(commandBuffer, vertices.len, 1, 0, 0);
+
             c.vkCmdEndRenderPass(commandBuffer);
             if (c.vkEndCommandBuffer(commandBuffer) != c.VkResult.VK_SUCCESS) return VulkanError.CommandBufferRecordError;
         }
@@ -285,7 +388,7 @@ const HelloTriangleApplication = struct {
             .flags = 0,
             .pNext = null,
         };
-        if (c.vkCreateCommandPool(self.device, &poolInfo, null, &self.commandPool) != c.VkResult.VK_SUCCESS) return VulkanError.CommandPoolCreationError;
+        if (c.vkCreateCommandPool(self.device, &poolInfo, null, &self.commandPool) != c.VkResult.VK_SUCCESS) return VulkanError.CommandPoolCreateError;
     }
 
     fn createFramebuffers(self: *HelloTriangleApplication) (AllocError || VulkanError)!void {
@@ -302,7 +405,7 @@ const HelloTriangleApplication = struct {
                 .pNext = null,
                 .flags = 0,
             };
-            if (c.vkCreateFramebuffer(self.device, &framebufferInfo, null, &self.swapChainFramebuffers[i]) != c.VkResult.VK_SUCCESS) return VulkanError.FramebufferCreationFail;
+            if (c.vkCreateFramebuffer(self.device, &framebufferInfo, null, &self.swapChainFramebuffers[i]) != c.VkResult.VK_SUCCESS) return VulkanError.FramebufferCreateFail;
         }
     }
 
@@ -354,10 +457,11 @@ const HelloTriangleApplication = struct {
             .pNext = null,
             .flags = 0,
         };
-        if (c.vkCreateRenderPass(self.device, &renderPassInfo, null, &self.renderPass) != c.VkResult.VK_SUCCESS) return VulkanError.RenderPassCreationFail;
+        if (c.vkCreateRenderPass(self.device, &renderPassInfo, null, &self.renderPass) != c.VkResult.VK_SUCCESS) return VulkanError.RenderPassCreateFail;
     }
 
     fn createGraphicsPipeline(self: *HelloTriangleApplication) (shader_utils.CompilationError || VulkanError || AllocError)!void {
+
         const vertShaderCode = try shader_utils.fileToSPV(self.allocator, "shader.vert");
         const fragShaderCode = try shader_utils.fileToSPV(self.allocator, "shader.frag");
         defer self.allocator.free(vertShaderCode);
@@ -388,15 +492,18 @@ const HelloTriangleApplication = struct {
         };
         const shaderStages = [_]c.VkPipelineShaderStageCreateInfo{ vertShaderStageInfo, fragShaderStageInfo };
 
+        const bindingDescription = Vertex.getBindingDescription();
+        const attributeDescriptions = Vertex.getAttributeDescriptions();
         const vertexInputInfo = c.VkPipelineVertexInputStateCreateInfo {
             .sType = c.VkStructureType.VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO,
-            .vertexBindingDescriptionCount = 0,
-            .pVertexBindingDescriptions = null,
-            .vertexAttributeDescriptionCount = 0,
-            .pVertexAttributeDescriptions = null,
+            .vertexBindingDescriptionCount = 1,
+            .pVertexBindingDescriptions = &bindingDescription,
+            .vertexAttributeDescriptionCount = attributeDescriptions.len,
+            .pVertexAttributeDescriptions = &attributeDescriptions,
             .pNext = null,
             .flags = 0,
         };
+
         const inputAssembly = c.VkPipelineInputAssemblyStateCreateInfo {
             .sType = c.VkStructureType.VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO,
             .topology = c.VkPrimitiveTopology.VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST,
@@ -480,7 +587,7 @@ const HelloTriangleApplication = struct {
             .pNext = null,
             .flags = 0,
         };
-        if (c.vkCreatePipelineLayout(self.device, &pipelineLayoutInfo, null, &self.pipelineLayout) != c.VkResult.VK_SUCCESS) return VulkanError.PipelineLayoutCreationFail;
+        if (c.vkCreatePipelineLayout(self.device, &pipelineLayoutInfo, null, &self.pipelineLayout) != c.VkResult.VK_SUCCESS) return VulkanError.PipelineLayoutCreateFail;
         const pipelineInfo = c.VkGraphicsPipelineCreateInfo {
             .sType = c.VkStructureType.VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO,
             .stageCount = 2,
@@ -502,7 +609,7 @@ const HelloTriangleApplication = struct {
             .flags = 0,
             .pTessellationState = null,
         };
-        if (c.vkCreateGraphicsPipelines(self.device, null, 1, &pipelineInfo, null, &self.graphicsPipeline) != c.VkResult.VK_SUCCESS) return VulkanError.GraphicsPipelineCreationFail;
+        if (c.vkCreateGraphicsPipelines(self.device, null, 1, &pipelineInfo, null, &self.graphicsPipeline) != c.VkResult.VK_SUCCESS) return VulkanError.GraphicsPipelineCreateFail;
     }
 
     fn createShaderModule(self: *HelloTriangleApplication, code: []const u8) VulkanError!c.VkShaderModule {
@@ -514,7 +621,7 @@ const HelloTriangleApplication = struct {
             .flags = 0,
         };
         var shaderModule: c.VkShaderModule = undefined;
-        if (c.vkCreateShaderModule(self.device, &createInfo, null, &shaderModule) != c.VkResult.VK_SUCCESS) return VulkanError.ShaderModuleCreationFail;
+        if (c.vkCreateShaderModule(self.device, &createInfo, null, &shaderModule) != c.VkResult.VK_SUCCESS) return VulkanError.ShaderModuleCreateFail;
         return shaderModule;
     }
 
@@ -542,7 +649,7 @@ const HelloTriangleApplication = struct {
                 .pNext = null,
                 .flags = 0,
             };
-            if (c.vkCreateImageView(self.device, &createInfo, null, &self.swapChainImageViews[i]) != c.VkResult.VK_SUCCESS) return VulkanError.ImageViewCreationFail;
+            if (c.vkCreateImageView(self.device, &createInfo, null, &self.swapChainImageViews[i]) != c.VkResult.VK_SUCCESS) return VulkanError.ImageViewCreateFail;
         }
     }
 
@@ -580,7 +687,7 @@ const HelloTriangleApplication = struct {
             .pNext = null,
             .flags = 0,
         };
-        if (c.vkCreateSwapchainKHR(self.device, &createInfo, null, &self.swapChain) != c.VkResult.VK_SUCCESS) return VulkanError.SwapChainCreationFail;
+        if (c.vkCreateSwapchainKHR(self.device, &createInfo, null, &self.swapChain) != c.VkResult.VK_SUCCESS) return VulkanError.SwapChainCreateFail;
         _ = c.vkGetSwapchainImagesKHR(self.device, self.swapChain, &imageCount, null);
         self.swapChainImages = try self.allocator.alloc(c.VkImage, imageCount);
         _ = c.vkGetSwapchainImagesKHR(self.device, self.swapChain, &imageCount, self.swapChainImages.ptr);
@@ -589,7 +696,7 @@ const HelloTriangleApplication = struct {
     }
 
     fn createSurface(self: *HelloTriangleApplication) !void {
-        if (c.glfwCreateWindowSurface(self.instance, self.window, null, &self.surface) != c.VkResult.VK_SUCCESS) return VulkanError.WindowSurfaceCreationFail;
+        if (c.glfwCreateWindowSurface(self.instance, self.window, null, &self.surface) != c.VkResult.VK_SUCCESS) return VulkanError.WindowSurfaceCreateFail;
     }
 
     fn pickPhysicalDevice(self: *HelloTriangleApplication) !void {
@@ -686,7 +793,7 @@ const HelloTriangleApplication = struct {
             .pNext = null,
             .flags = 0,
         };
-        if (c.vkCreateDevice(self.physicalDevice, &createInfo, null, &self.device) != c.VkResult.VK_SUCCESS) return VulkanError.LogicalDeviceCreationFail;
+        if (c.vkCreateDevice(self.physicalDevice, &createInfo, null, &self.device) != c.VkResult.VK_SUCCESS) return VulkanError.LogicalDeviceCreateFail;
         c.vkGetDeviceQueue(self.device, indices.graphicsFamily.?, 0, &self.graphicsQueue);
         c.vkGetDeviceQueue(self.device, indices.presentFamily.?, 0, &self.presentQueue);
     }
@@ -714,7 +821,7 @@ const HelloTriangleApplication = struct {
             .flags = 0,
             .pNext = null,
         };
-        if (c.vkCreateInstance(&createInfo, null, &self.instance) != c.VkResult.VK_SUCCESS) return VulkanError.InstanceCreationError;
+        if (c.vkCreateInstance(&createInfo, null, &self.instance) != c.VkResult.VK_SUCCESS) return VulkanError.InstanceCreateError;
     }
 
     fn mainLoop(self: *HelloTriangleApplication) (VulkanError || AllocError || shader_utils.CompilationError)!void {
@@ -800,6 +907,9 @@ const HelloTriangleApplication = struct {
 
     fn cleanup(self: *HelloTriangleApplication) void {
         self.cleanupSwapChain();
+
+        c.vkDestroyBuffer(self.device, self.vertexBuffer, null);
+        c.vkFreeMemory(self.device, self.vertexBufferMemory, null);
 
         var i: u32 = 0;
         while (i < MAX_FRAMES_IN_FLIGHT) : (i += 1) {
