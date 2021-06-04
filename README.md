@@ -1,4 +1,4 @@
-# Vulkan Tutorail Zig
+# Vulkan Tutorial Completion Zig
 
 I'm just following along the [Vulkan Tutorial](https://vulkan-tutorial.com/) in Zig, here's the repo for my progress.
 
