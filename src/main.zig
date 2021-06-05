@@ -96,10 +96,13 @@ const Vertex = extern struct {
 };
 
 const vertices = [_]Vertex {
-    Vertex { .pos = Vec2.new(0.0, -0.5), .color = Vec3.new(1.0, 0.0, 0.0) },
-    Vertex { .pos = Vec2.new(0.5, 0.5), .color = Vec3.new(0.0, 1.0, 0.0) },
-    Vertex { .pos = Vec2.new(-0.5, 0.5), .color = Vec3.new(0.0, 0.0, 1.0) },
+    Vertex { .pos = Vec2.new(-0.5, -0.5), .color = Vec3.new(1.0, 0.0, 0.0) },
+    Vertex { .pos = Vec2.new(0.5, -0.5), .color = Vec3.new(0.0, 1.0, 0.0) },
+    Vertex { .pos = Vec2.new(0.5, 0.5), .color = Vec3.new(0.0, 0.0, 1.0) },
+    Vertex { .pos = Vec2.new(-0.5, 0.5), .color = Vec3.new(1.0, 1.0, 1.0) },
 };
+
+const indices = [_]u16{0, 1, 2, 2, 3, 0};
 
 const SwapChainSupportDetails = struct {
     capabilities: c.VkSurfaceCapabilitiesKHR,
@@ -142,7 +145,7 @@ const QueueFamilyIndices = struct {
     presentFamily: ?u32 = null,
 
     fn findQueueFamilies(allocator: *std.mem.Allocator, device: c.VkPhysicalDevice, surface: c.VkSurfaceKHR) AllocError!QueueFamilyIndices {
-        var indices = QueueFamilyIndices {};
+        var indicesQ = QueueFamilyIndices {};
         var queueFamilyCount: u32 = 0;
         c.vkGetPhysicalDeviceQueueFamilyProperties(device, &queueFamilyCount, null);
 
@@ -151,14 +154,14 @@ const QueueFamilyIndices = struct {
         c.vkGetPhysicalDeviceQueueFamilyProperties(device, &queueFamilyCount, queueFamilies.ptr);
         for (queueFamilies) |queueFamily, i| {
             if (queueFamily.queueFlags & c.VK_QUEUE_GRAPHICS_BIT != 0) {
-                indices.graphicsFamily = @intCast(u32, i);
+                indicesQ.graphicsFamily = @intCast(u32, i);
             }
             var presentSupport = c.VK_FALSE;
             _ = c.vkGetPhysicalDeviceSurfaceSupportKHR(device, @intCast(u32, i), surface, &presentSupport);
-            if (presentSupport == c.VK_TRUE) indices.presentFamily = @intCast(u32, i);
-            if (indices.isComplete()) break;
+            if (presentSupport == c.VK_TRUE) indicesQ.presentFamily = @intCast(u32, i);
+            if (indicesQ.isComplete()) break;
         }
-        return indices;
+        return indicesQ;
     }
 
     fn isComplete(self: *const QueueFamilyIndices) bool {
@@ -202,6 +205,8 @@ const HelloTriangleApplication = struct {
 
     vertexBuffer: c.VkBuffer = undefined,
     vertexBufferMemory: c.VkDeviceMemory = undefined,
+    indexBuffer: c.VkBuffer = undefined,
+    indexBufferMemory: c.VkDeviceMemory = undefined,
 
     pub fn run(self: *HelloTriangleApplication) !void {
         self.initWindow();
@@ -242,6 +247,7 @@ const HelloTriangleApplication = struct {
         try self.createFramebuffers();
         try self.createCommandPool();
         try self.createVertexBuffer();
+        try self.createIndexBuffer();
         try self.createCommandBuffers();
         try self.createSyncObjects();
     }
@@ -272,8 +278,9 @@ const HelloTriangleApplication = struct {
         _ = c.vkBindBufferMemory(self.device, buffer.*, bufferMemory.*, 0);
     }
 
-    fn createVertexBuffer(self: *HelloTriangleApplication) VulkanError!void {
-        const bufferSize = @sizeOf(Vertex) * vertices.len;
+    fn createIndexBuffer(self: *HelloTriangleApplication) VulkanError!void {
+        const inner_type = @TypeOf(indices[0]);
+        const bufferSize = @sizeOf(inner_type) * indices.len;
 
         var stagingBuffer: c.VkBuffer = undefined;
         var stagingBufferMemory: c.VkDeviceMemory = undefined;
@@ -281,7 +288,28 @@ const HelloTriangleApplication = struct {
 
         var data: ?*c_void = undefined;
         _ = c.vkMapMemory(self.device, stagingBufferMemory, 0, bufferSize, 0, &data);
-        std.mem.copy(Vertex, @ptrCast([*]Vertex, @alignCast(4, data))[0..vertices.len], &vertices);
+        std.mem.copy(inner_type, @ptrCast([*]inner_type, @alignCast(4, data))[0..indices.len], &indices);
+        c.vkUnmapMemory(self.device, stagingBufferMemory);
+
+        try self.createBuffer(bufferSize, c.VK_BUFFER_USAGE_INDEX_BUFFER_BIT | c.VK_BUFFER_USAGE_TRANSFER_DST_BIT, c.VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, &self.indexBuffer, &self.indexBufferMemory);
+
+        self.copyBuffer(stagingBuffer, self.indexBuffer, bufferSize);
+
+        c.vkDestroyBuffer(self.device, stagingBuffer, null);
+        c.vkFreeMemory(self.device, stagingBufferMemory, null);
+    }
+
+    fn createVertexBuffer(self: *HelloTriangleApplication) VulkanError!void {
+        const inner_type = @TypeOf(vertices[0]);
+        const bufferSize = @sizeOf(inner_type) * vertices.len;
+
+        var stagingBuffer: c.VkBuffer = undefined;
+        var stagingBufferMemory: c.VkDeviceMemory = undefined;
+        try self.createBuffer(bufferSize, c.VK_BUFFER_USAGE_TRANSFER_SRC_BIT, c.VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | c.VK_MEMORY_PROPERTY_HOST_COHERENT_BIT, &stagingBuffer, &stagingBufferMemory);
+
+        var data: ?*c_void = undefined;
+        _ = c.vkMapMemory(self.device, stagingBufferMemory, 0, bufferSize, 0, &data);
+        std.mem.copy(inner_type, @ptrCast([*]inner_type, @alignCast(4, data))[0..vertices.len], &vertices);
         c.vkUnmapMemory(self.device, stagingBufferMemory);
 
         try self.createBuffer(bufferSize, c.VK_BUFFER_USAGE_VERTEX_BUFFER_BIT | c.VK_BUFFER_USAGE_TRANSFER_DST_BIT, c.VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, &self.vertexBuffer, &self.vertexBufferMemory);
@@ -434,8 +462,9 @@ const HelloTriangleApplication = struct {
             const offsets = [_]u64{ 0 };
 
             c.vkCmdBindVertexBuffers(commandBuffer, 0, 1, &vertexBuffers, &offsets);
+            c.vkCmdBindIndexBuffer(commandBuffer, self.indexBuffer, 0, c.VkIndexType.VK_INDEX_TYPE_UINT16);
 
-            c.vkCmdDraw(commandBuffer, vertices.len, 1, 0, 0);
+            c.vkCmdDrawIndexed(commandBuffer, indices.len, 1, 0, 0, 0);
 
             c.vkCmdEndRenderPass(commandBuffer);
             if (c.vkEndCommandBuffer(commandBuffer) != c.VkResult.VK_SUCCESS) return VulkanError.CommandBufferRecordError;
@@ -726,9 +755,9 @@ const HelloTriangleApplication = struct {
         if (swapChainSupport.capabilities.maxImageCount > 0 and imageCount > swapChainSupport.capabilities.maxImageCount) {
             imageCount = swapChainSupport.capabilities.maxImageCount;
         }
-        const indices = try QueueFamilyIndices.findQueueFamilies(self.allocator, self.physicalDevice, self.surface);
-        const queueFamilyIndices = [2]u32 {indices.graphicsFamily.?, indices.presentFamily.?};
-        const sameQueue = indices.graphicsFamily.? == indices.presentFamily.?;
+        const indicesQ = try QueueFamilyIndices.findQueueFamilies(self.allocator, self.physicalDevice, self.surface);
+        const queueFamilyIndices = [2]u32 {indicesQ.graphicsFamily.?, indicesQ.presentFamily.?};
+        const sameQueue = indicesQ.graphicsFamily.? == indicesQ.presentFamily.?;
         const createInfo = c.VkSwapchainCreateInfoKHR {
             .sType = c.VkStructureType.VK_STRUCTURE_TYPE_SWAPCHAIN_CREATE_INFO_KHR,
             .surface = self.surface,
@@ -776,11 +805,11 @@ const HelloTriangleApplication = struct {
     }
 
     fn createLogicalDevice(self: *HelloTriangleApplication) !void {
-        const indices = try QueueFamilyIndices.findQueueFamilies(self.allocator, self.physicalDevice, self.surface);
+        const indicesQ = try QueueFamilyIndices.findQueueFamilies(self.allocator, self.physicalDevice, self.surface);
         const queuePriority: f32 = 1.0;
         const queueCreateInfo = c.VkDeviceQueueCreateInfo {
             .sType = c.VkStructureType.VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO,
-            .queueFamilyIndex = indices.graphicsFamily.?,
+            .queueFamilyIndex = indicesQ.graphicsFamily.?,
             .queueCount = 1,
             .pQueuePriorities = &queuePriority,
             .pNext = null,
@@ -856,8 +885,8 @@ const HelloTriangleApplication = struct {
             .flags = 0,
         };
         if (c.vkCreateDevice(self.physicalDevice, &createInfo, null, &self.device) != c.VkResult.VK_SUCCESS) return VulkanError.LogicalDeviceCreateFail;
-        c.vkGetDeviceQueue(self.device, indices.graphicsFamily.?, 0, &self.graphicsQueue);
-        c.vkGetDeviceQueue(self.device, indices.presentFamily.?, 0, &self.presentQueue);
+        c.vkGetDeviceQueue(self.device, indicesQ.graphicsFamily.?, 0, &self.graphicsQueue);
+        c.vkGetDeviceQueue(self.device, indicesQ.presentFamily.?, 0, &self.presentQueue);
     }
 
     fn createInstance(self: *HelloTriangleApplication) !void {
@@ -973,6 +1002,9 @@ const HelloTriangleApplication = struct {
         c.vkDestroyBuffer(self.device, self.vertexBuffer, null);
         c.vkFreeMemory(self.device, self.vertexBufferMemory, null);
 
+        c.vkDestroyBuffer(self.device, self.indexBuffer, null);
+        c.vkFreeMemory(self.device, self.indexBufferMemory, null);
+
         var i: u32 = 0;
         while (i < MAX_FRAMES_IN_FLIGHT) : (i += 1) {
             c.vkDestroySemaphore(self.device, self.renderFinishedSemaphores[i], null);
@@ -995,7 +1027,7 @@ const HelloTriangleApplication = struct {
     }
 
     fn isDeviceSuitable(self: *HelloTriangleApplication, device: c.VkPhysicalDevice) AllocError!bool {
-        const indices = try QueueFamilyIndices.findQueueFamilies(self.allocator, device, self.surface);
+        const indicesQ = try QueueFamilyIndices.findQueueFamilies(self.allocator, device, self.surface);
         var extensionsSupported = try checkDeviceExtensionSupport(self.allocator, device);
         var swapChainAdequate = false;
         if (extensionsSupported) {
@@ -1003,7 +1035,7 @@ const HelloTriangleApplication = struct {
             defer swapChainSupport.deinit(self.allocator);
             swapChainAdequate = swapChainSupport.formats.len != 0 and swapChainSupport.presentModes.len != 0;
         }
-        return indices.isComplete() and extensionsSupported and swapChainAdequate;
+        return indicesQ.isComplete() and extensionsSupported and swapChainAdequate;
     }
     fn chooseSwapSurfaceFormat(self: *HelloTriangleApplication, availableFormats: []const c.VkSurfaceFormatKHR) c.VkSurfaceFormatKHR {
         for (availableFormats) |availableFormat| {
