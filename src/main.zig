@@ -245,36 +245,99 @@ const HelloTriangleApplication = struct {
         try self.createCommandBuffers();
         try self.createSyncObjects();
     }
-
-    fn createVertexBuffer(self: *HelloTriangleApplication) VulkanError!void {
+    
+    fn createBuffer(self: *HelloTriangleApplication, size: c.VkDeviceSize, usage: c.VkBufferUsageFlags, properties: c.VkMemoryPropertyFlags, buffer: *c.VkBuffer, bufferMemory: *c.VkDeviceMemory) VulkanError!void {
         const bufferInfo = c.VkBufferCreateInfo {
             .sType = c.VkStructureType.VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
-            .size = @sizeOf(Vertex) * vertices.len,
-            .usage = c.VK_BUFFER_USAGE_VERTEX_BUFFER_BIT,
+            .size = size,
+            .usage = usage,
             .sharingMode = c.VkSharingMode.VK_SHARING_MODE_EXCLUSIVE,
             .queueFamilyIndexCount = 0,
             .pQueueFamilyIndices = null,
             .flags = 0,
             .pNext = null,
         };
-        if (c.vkCreateBuffer(self.device, &bufferInfo, null, &self.vertexBuffer) != c.VkResult.VK_SUCCESS) return VulkanError.VertexBufferCreateFail;
+        if (c.vkCreateBuffer(self.device, &bufferInfo, null, buffer) != c.VkResult.VK_SUCCESS) return VulkanError.VertexBufferCreateFail;
 
         var memRequirements: c.VkMemoryRequirements = undefined;
-        c.vkGetBufferMemoryRequirements(self.device, self.vertexBuffer, &memRequirements);
+        c.vkGetBufferMemoryRequirements(self.device, buffer.*, &memRequirements);
 
         const allocInfo = c.VkMemoryAllocateInfo {
             .sType = c.VkStructureType.VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
             .allocationSize = memRequirements.size,
-            .memoryTypeIndex = try self.findMemoryType(memRequirements.memoryTypeBits, c.VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | c.VK_MEMORY_PROPERTY_HOST_COHERENT_BIT),
+            .memoryTypeIndex = try self.findMemoryType(memRequirements.memoryTypeBits, properties),
             .pNext = null,
         };
-        if (c.vkAllocateMemory(self.device, &allocInfo, null, &self.vertexBufferMemory) != c.VkResult.VK_SUCCESS) return VulkanError.VertexBufferMemoryAllocateFail;
-        _ = c.vkBindBufferMemory(self.device, self.vertexBuffer, self.vertexBufferMemory, 0);
+        if (c.vkAllocateMemory(self.device, &allocInfo, null, bufferMemory) != c.VkResult.VK_SUCCESS) return VulkanError.VertexBufferMemoryAllocateFail;
+        _ = c.vkBindBufferMemory(self.device, buffer.*, bufferMemory.*, 0);
+    }
+
+    fn createVertexBuffer(self: *HelloTriangleApplication) VulkanError!void {
+        const bufferSize = @sizeOf(Vertex) * vertices.len;
+
+        var stagingBuffer: c.VkBuffer = undefined;
+        var stagingBufferMemory: c.VkDeviceMemory = undefined;
+        try self.createBuffer(bufferSize, c.VK_BUFFER_USAGE_TRANSFER_SRC_BIT, c.VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | c.VK_MEMORY_PROPERTY_HOST_COHERENT_BIT, &stagingBuffer, &stagingBufferMemory);
 
         var data: ?*c_void = undefined;
-        _ = c.vkMapMemory(self.device, self.vertexBufferMemory, 0, bufferInfo.size, 0, &data);
+        _ = c.vkMapMemory(self.device, stagingBufferMemory, 0, bufferSize, 0, &data);
         std.mem.copy(Vertex, @ptrCast([*]Vertex, @alignCast(4, data))[0..vertices.len], &vertices);
-        c.vkUnmapMemory(self.device, self.vertexBufferMemory);
+        c.vkUnmapMemory(self.device, stagingBufferMemory);
+
+        try self.createBuffer(bufferSize, c.VK_BUFFER_USAGE_VERTEX_BUFFER_BIT | c.VK_BUFFER_USAGE_TRANSFER_DST_BIT, c.VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, &self.vertexBuffer, &self.vertexBufferMemory);
+
+        self.copyBuffer(stagingBuffer, self.vertexBuffer, bufferSize);
+
+        c.vkDestroyBuffer(self.device, stagingBuffer, null);
+        c.vkFreeMemory(self.device, stagingBufferMemory, null);
+    }
+
+    fn copyBuffer(self: *HelloTriangleApplication, srcBuffer: c.VkBuffer, dstBuffer: c.VkBuffer, size: c.VkDeviceSize) void {
+        const allocInfo = c.VkCommandBufferAllocateInfo {
+            .sType = c.VkStructureType.VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO,
+            .level = c.VkCommandBufferLevel.VK_COMMAND_BUFFER_LEVEL_PRIMARY,
+            .commandPool = self.commandPool,
+            .commandBufferCount = 1,
+            .pNext = null,
+        };
+
+        var commandBuffer: c.VkCommandBuffer = undefined;
+        _ = c.vkAllocateCommandBuffers(self.device, &allocInfo, &commandBuffer);
+
+        const beginInfo = c.VkCommandBufferBeginInfo {
+            .sType = c.VkStructureType.VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
+            .flags = c.VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT,
+            .pInheritanceInfo = null,
+            .pNext = null,
+        };
+
+        _ = c.vkBeginCommandBuffer(commandBuffer, &beginInfo);
+
+        const copyRegion = c.VkBufferCopy {
+            .srcOffset = 0,
+            .dstOffset = 0,
+            .size = size,
+        };
+
+        c.vkCmdCopyBuffer(commandBuffer, srcBuffer, dstBuffer, 1, &copyRegion);
+        _ = c.vkEndCommandBuffer(commandBuffer);
+
+        const submitInfo = c.VkSubmitInfo {
+            .sType = c.VkStructureType.VK_STRUCTURE_TYPE_SUBMIT_INFO,
+            .commandBufferCount = 1,
+            .pCommandBuffers = &commandBuffer,
+            .waitSemaphoreCount = 0,
+            .pWaitSemaphores = null,
+            .signalSemaphoreCount = 0,
+            .pSignalSemaphores = null,
+            .pWaitDstStageMask = null,
+            .pNext = null,
+        };
+
+        _ = c.vkQueueSubmit(self.graphicsQueue, 1, &submitInfo, null);
+        _ = c.vkQueueWaitIdle(self.graphicsQueue);
+
+        c.vkFreeCommandBuffers(self.device, self.commandPool, 1, &commandBuffer);
     }
 
     fn findMemoryType(self: *HelloTriangleApplication, typeFilter: u32, properties: c.VkMemoryPropertyFlags) VulkanError!u32 {
