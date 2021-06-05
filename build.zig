@@ -22,8 +22,6 @@ pub fn build(b: *std.build.Builder) void {
     exe.linkSystemLibrary("shaderc_combined");
     exe.addIncludeDir("vendor/include/");
 
-    exe.addPackagePath("zalgebra", "./deps/zalgebra/src/main.zig");
-
     exe.setTarget(target);
     exe.setBuildMode(mode);
     exe.install();

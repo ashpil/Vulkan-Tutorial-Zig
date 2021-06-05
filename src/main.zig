@@ -1,9 +1,9 @@
 const std = @import("std");
 const shader_utils = @import("shader_utils.zig");
 
-const zalgebra = @import("zalgebra");
-const Vec2 = zalgebra.vec2;
-const Vec3 = zalgebra.vec3;
+const zug = @import("zug.zig");
+const Vec2 = zug.Vec2(f32);
+const Vec3 = zug.Vec3(f32);
 
 const c = @cImport({
     @cDefine("GLFW_INCLUDE_VULKAN", {});
@@ -88,7 +88,7 @@ const Vertex = extern struct {
             .binding = 0,
             .location = 1,
             .format = c.VkFormat.VK_FORMAT_R32G32B32_SFLOAT,
-            .offset = @bitOffsetOf(Vertex, "color"),
+            .offset = @byteOffsetOf(Vertex, "color"),
         };
 
         return .{ attributeDescriptionPos, attributeDescriptionColor };
@@ -271,10 +271,9 @@ const HelloTriangleApplication = struct {
         if (c.vkAllocateMemory(self.device, &allocInfo, null, &self.vertexBufferMemory) != c.VkResult.VK_SUCCESS) return VulkanError.VertexBufferMemoryAllocateFail;
         _ = c.vkBindBufferMemory(self.device, self.vertexBuffer, self.vertexBufferMemory, 0);
 
-        var data: []Vertex = undefined;
-        data.len = vertices.len;
-        _ = c.vkMapMemory(self.device, self.vertexBufferMemory, 0, bufferInfo.size, 0, @ptrCast(*?*c_void, &data.ptr));
-        std.mem.copy(Vertex, data, &vertices);
+        var data: ?*c_void = undefined;
+        _ = c.vkMapMemory(self.device, self.vertexBufferMemory, 0, bufferInfo.size, 0, &data);
+        std.mem.copy(Vertex, @ptrCast([*]Vertex, @alignCast(4, data))[0..vertices.len], &vertices);
         c.vkUnmapMemory(self.device, self.vertexBufferMemory);
     }
 
@@ -282,9 +281,9 @@ const HelloTriangleApplication = struct {
         var memProperties: c.VkPhysicalDeviceMemoryProperties = undefined;
         c.vkGetPhysicalDeviceMemoryProperties(self.physicalDevice, &memProperties);
 
-        var i: u32 = 0;
+        var i: u5 = 0;
         while (i < memProperties.memoryTypeCount) : (i += 1) {
-            if (typeFilter & (@as(u32, 1) << @intCast(u5, i)) != 0 and (memProperties.memoryTypes[i].propertyFlags & properties) == properties) {
+            if (typeFilter & (@as(u32, 1) << i) != 0 and (memProperties.memoryTypes[i].propertyFlags & properties) == properties) {
                 return i;
             }
         }
