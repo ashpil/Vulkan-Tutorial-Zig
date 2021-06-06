@@ -4,6 +4,7 @@ const shader_utils = @import("shader_utils.zig");
 const zug = @import("zug.zig");
 const Vec2 = zug.Vec2(f32);
 const Vec3 = zug.Vec3(f32);
+const Mat4 = zug.Mat4(f32);
 
 const c = @cImport({
     @cDefine("GLFW_INCLUDE_VULKAN", {});
@@ -32,9 +33,12 @@ const VulkanError = error {
     DrawCommandSubmitFail,
     SwapChainImageAcquireFail,
     SwapChainImagePresentFail,
-    VertexBufferCreateFail,
     MemoryTypeFindFail,
-    VertexBufferMemoryAllocateFail,
+    BufferCreateFail,
+    BufferMemoryAllocateFail,
+    DescriptorSetLayoutCreateFail,
+    DescriptorPoolCreateFail,
+    DescriptorSetAllocateFail,
 };
 
 const AllocError = std.mem.Allocator.Error;
@@ -100,6 +104,12 @@ const vertices = [_]Vertex {
     Vertex { .pos = Vec2.new(0.5, -0.5), .color = Vec3.new(0.0, 1.0, 0.0) },
     Vertex { .pos = Vec2.new(0.5, 0.5), .color = Vec3.new(0.0, 0.0, 1.0) },
     Vertex { .pos = Vec2.new(-0.5, 0.5), .color = Vec3.new(1.0, 1.0, 1.0) },
+};
+
+const UniformBufferObject = extern struct {
+    model: Mat4,
+    view: Mat4,
+    proj: Mat4,
 };
 
 const indices = [_]u16{0, 1, 2, 2, 3, 0};
@@ -171,6 +181,7 @@ const QueueFamilyIndices = struct {
 
 const HelloTriangleApplication = struct {
     allocator: *std.mem.Allocator,
+    timer: std.time.Timer,
 
     window: *c.GLFWwindow = undefined,
     instance: c.VkInstance = undefined,
@@ -187,6 +198,10 @@ const HelloTriangleApplication = struct {
     swapChainImageFormat: c.VkFormat = undefined,
     swapChainExtent: c.VkExtent2D = undefined,
     swapChainFramebuffers: []c.VkFramebuffer = undefined,
+
+    descriptorPool: c.VkDescriptorPool = undefined,
+    descriptorSetLayout: c.VkDescriptorSetLayout = undefined,
+    descriptorSets: []c.VkDescriptorSet = undefined,
 
     renderPass: c.VkRenderPass = undefined,
     pipelineLayout: c.VkPipelineLayout = undefined,
@@ -207,6 +222,9 @@ const HelloTriangleApplication = struct {
     vertexBufferMemory: c.VkDeviceMemory = undefined,
     indexBuffer: c.VkBuffer = undefined,
     indexBufferMemory: c.VkDeviceMemory = undefined,
+
+    uniformBuffers: []c.VkBuffer = undefined,
+    uniformBuffersMemory: []c.VkDeviceMemory = undefined,
 
     pub fn run(self: *HelloTriangleApplication) !void {
         self.initWindow();
@@ -243,13 +261,111 @@ const HelloTriangleApplication = struct {
         try self.createSwapChain();
         try self.createImageViews();
         try self.createRenderPass();
+        try self.createDescriptorSetLayout();
         try self.createGraphicsPipeline();
         try self.createFramebuffers();
         try self.createCommandPool();
         try self.createVertexBuffer();
         try self.createIndexBuffer();
+        try self.createUniformBuffers();
+        try self.createDescriptorPool();
+        try self.createDescriptorSets();
         try self.createCommandBuffers();
         try self.createSyncObjects();
+    }
+
+    fn createDescriptorSets(self: *HelloTriangleApplication) (AllocError || VulkanError)!void {
+        var layouts = try self.allocator.alloc(c.VkDescriptorSetLayout, self.swapChainImages.len);
+        for (layouts) |*layout| {
+            layout.* = self.descriptorSetLayout;
+        }
+        defer self.allocator.free(layouts);
+
+        const allocInfo = c.VkDescriptorSetAllocateInfo {
+            .sType = c.VkStructureType.VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO,
+            .descriptorPool = self.descriptorPool,
+            .descriptorSetCount = @intCast(u32, self.swapChainImages.len),
+            .pSetLayouts = layouts.ptr,
+            .pNext = null,
+        };
+
+        self.descriptorSets = try self.allocator.alloc(c.VkDescriptorSet, self.swapChainImages.len);
+        if (c.vkAllocateDescriptorSets(self.device, &allocInfo, self.descriptorSets.ptr) != c.VkResult.VK_SUCCESS) return VulkanError.DescriptorSetAllocateFail;
+
+        var i: u32 = 0;
+        while (i < self.swapChainImages.len) : (i += 1) {
+            const bufferInfo = c.VkDescriptorBufferInfo {
+                .buffer = self.uniformBuffers[i],
+                .offset = 0,
+                .range = @sizeOf(UniformBufferObject),
+            };
+
+            const descriptorWrite = c.VkWriteDescriptorSet {
+                .sType = c.VkStructureType.VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
+                .dstSet = self.descriptorSets[i],
+                .dstBinding = 0,
+                .dstArrayElement = 0,
+                .descriptorType = c.VkDescriptorType.VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,
+                .descriptorCount = 1,
+                .pBufferInfo = &bufferInfo,
+                .pImageInfo = null,
+                .pTexelBufferView = null,
+                .pNext = null,
+            };
+
+            c.vkUpdateDescriptorSets(self.device, 1, &descriptorWrite, 0, null);
+        }
+    }
+
+    fn createDescriptorPool(self: *HelloTriangleApplication) VulkanError!void {
+        const poolSize = c.VkDescriptorPoolSize {
+            .type = c.VkDescriptorType.VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,
+            .descriptorCount = @intCast(u32, self.swapChainImages.len),
+        };
+
+        const poolInfo = c.VkDescriptorPoolCreateInfo {
+            .sType = c.VkStructureType.VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO,
+            .poolSizeCount = 1,
+            .pPoolSizes = &poolSize,
+            .maxSets = @intCast(u32, self.swapChainImages.len),
+            .pNext = null,
+            .flags = 0,
+        };
+
+        if (c.vkCreateDescriptorPool(self.device, &poolInfo, null, &self.descriptorPool) != c.VkResult.VK_SUCCESS) return VulkanError.DescriptorPoolCreateFail;
+    }
+
+    fn createUniformBuffers(self: *HelloTriangleApplication) (AllocError || VulkanError)!void {
+        const bufferSize = @sizeOf(UniformBufferObject);
+
+        self.uniformBuffers = try self.allocator.alloc(c.VkBuffer, self.swapChainImages.len);
+        self.uniformBuffersMemory = try self.allocator.alloc(c.VkDeviceMemory, self.swapChainImages.len);
+
+
+        var i: u32 = 0;
+        while (i < self.uniformBuffers.len) : (i += 1) {
+            try self.createBuffer(bufferSize, c.VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT, c.VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | c.VK_MEMORY_PROPERTY_HOST_COHERENT_BIT, &self.uniformBuffers[i], &self.uniformBuffersMemory[i]);
+        }
+    }
+
+    fn createDescriptorSetLayout(self: *HelloTriangleApplication) VulkanError!void {
+        const uboLayoutBinding = c.VkDescriptorSetLayoutBinding {
+            .binding = 0,
+            .descriptorType = c.VkDescriptorType.VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,
+            .descriptorCount = 1,
+            .stageFlags = c.VK_SHADER_STAGE_VERTEX_BIT,
+            .pImmutableSamplers = null,
+        };
+
+        const layoutInfo = c.VkDescriptorSetLayoutCreateInfo {
+            .sType = c.VkStructureType.VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO,
+            .bindingCount = 1,
+            .pBindings = &uboLayoutBinding,
+            .pNext = null,
+            .flags = 0,
+        };
+
+        if (c.vkCreateDescriptorSetLayout(self.device, &layoutInfo, null, &self.descriptorSetLayout) != c.VkResult.VK_SUCCESS) return VulkanError.DescriptorSetLayoutCreateFail;
     }
     
     fn createBuffer(self: *HelloTriangleApplication, size: c.VkDeviceSize, usage: c.VkBufferUsageFlags, properties: c.VkMemoryPropertyFlags, buffer: *c.VkBuffer, bufferMemory: *c.VkDeviceMemory) VulkanError!void {
@@ -263,7 +379,7 @@ const HelloTriangleApplication = struct {
             .flags = 0,
             .pNext = null,
         };
-        if (c.vkCreateBuffer(self.device, &bufferInfo, null, buffer) != c.VkResult.VK_SUCCESS) return VulkanError.VertexBufferCreateFail;
+        if (c.vkCreateBuffer(self.device, &bufferInfo, null, buffer) != c.VkResult.VK_SUCCESS) return VulkanError.BufferCreateFail;
 
         var memRequirements: c.VkMemoryRequirements = undefined;
         c.vkGetBufferMemoryRequirements(self.device, buffer.*, &memRequirements);
@@ -274,7 +390,7 @@ const HelloTriangleApplication = struct {
             .memoryTypeIndex = try self.findMemoryType(memRequirements.memoryTypeBits, properties),
             .pNext = null,
         };
-        if (c.vkAllocateMemory(self.device, &allocInfo, null, bufferMemory) != c.VkResult.VK_SUCCESS) return VulkanError.VertexBufferMemoryAllocateFail;
+        if (c.vkAllocateMemory(self.device, &allocInfo, null, bufferMemory) != c.VkResult.VK_SUCCESS) return VulkanError.BufferMemoryAllocateFail;
         _ = c.vkBindBufferMemory(self.device, buffer.*, bufferMemory.*, 0);
     }
 
@@ -399,6 +515,9 @@ const HelloTriangleApplication = struct {
         try self.createRenderPass();
         try self.createGraphicsPipeline();
         try self.createFramebuffers();
+        try self.createUniformBuffers();
+        try self.createDescriptorPool();
+        try self.createDescriptorSets();
         try self.createCommandBuffers();
     }
 
@@ -464,6 +583,7 @@ const HelloTriangleApplication = struct {
             c.vkCmdBindVertexBuffers(commandBuffer, 0, 1, &vertexBuffers, &offsets);
             c.vkCmdBindIndexBuffer(commandBuffer, self.indexBuffer, 0, c.VkIndexType.VK_INDEX_TYPE_UINT16);
 
+            c.vkCmdBindDescriptorSets(commandBuffer, c.VkPipelineBindPoint.VK_PIPELINE_BIND_POINT_GRAPHICS, self.pipelineLayout, 0, 1, &self.descriptorSets[i], 0, null);
             c.vkCmdDrawIndexed(commandBuffer, indices.len, 1, 0, 0, 0);
 
             c.vkCmdEndRenderPass(commandBuffer);
@@ -630,7 +750,7 @@ const HelloTriangleApplication = struct {
             .polygonMode = c.VkPolygonMode.VK_POLYGON_MODE_FILL,
             .lineWidth = 1.0,
             .cullMode = c.VK_CULL_MODE_BACK_BIT,
-            .frontFace = c.VkFrontFace.VK_FRONT_FACE_CLOCKWISE,
+            .frontFace = c.VkFrontFace.VK_FRONT_FACE_COUNTER_CLOCKWISE,
             .depthBiasEnable = c.VK_FALSE,
             .depthBiasConstantFactor = 0.0,
             .depthBiasClamp = 0.0,
@@ -671,8 +791,8 @@ const HelloTriangleApplication = struct {
         };
         const pipelineLayoutInfo = c.VkPipelineLayoutCreateInfo {
             .sType = c.VkStructureType.VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO,
-            .setLayoutCount = 0,
-            .pSetLayouts = null,
+            .setLayoutCount = 1,
+            .pSetLayouts = &self.descriptorSetLayout,
             .pushConstantRangeCount = 0,
             .pPushConstantRanges = null,
             .pNext = null,
@@ -938,6 +1058,8 @@ const HelloTriangleApplication = struct {
 
         const signalSemaphores = [_]c.VkSemaphore { self.renderFinishedSemaphores[self.currentFrame] };
         const waitSemaphores = [_]c.VkSemaphore { self.imageAvailableSemaphores[self.currentFrame] };
+        self.updateUniformBuffer(imageIndex);
+
         const submitInfo = c.VkSubmitInfo {
             .sType = c.VkStructureType.VK_STRUCTURE_TYPE_SUBMIT_INFO,
             .waitSemaphoreCount = waitSemaphores.len,
@@ -974,6 +1096,22 @@ const HelloTriangleApplication = struct {
         self.currentFrame = (self.currentFrame + 1) % MAX_FRAMES_IN_FLIGHT;
     }
 
+    fn updateUniformBuffer(self: *HelloTriangleApplication, currentImage: usize) void {
+        const time = @intToFloat(f32, self.timer.read()) / 1000000000.0;
+
+        const ubo: *[1]UniformBufferObject = &UniformBufferObject {
+            .model = Mat4.fromAxisAngle(time * std.math.pi / 2, Vec3.new(0.0, 0.0, 1.0)),
+            .view = Mat4.lookAt(Vec3.new(2.0, 2.0, 2.0), Vec3.new(0.0, 0.0, 0.0), Vec3.new(0.0, 0.0, 1.0)),
+            .proj = Mat4.perspective(std.math.pi / 4.0, @intToFloat(f32, self.swapChainExtent.width) / @intToFloat(f32, self.swapChainExtent.height), 0.1, 10.0),
+        };
+
+        var data: ?*c_void = undefined;
+        const size = @sizeOf(UniformBufferObject);
+        _ = c.vkMapMemory(self.device, self.uniformBuffersMemory[currentImage], 0, size, 0, &data);
+        std.mem.copy(UniformBufferObject, @ptrCast([*]UniformBufferObject, @alignCast(4, data))[0..size], ubo[0..1]);
+        c.vkUnmapMemory(self.device, self.uniformBuffersMemory[currentImage]);
+    }
+
     fn cleanupSwapChain(self: *HelloTriangleApplication) void {
         for (self.swapChainFramebuffers) |framebuffer| {
             c.vkDestroyFramebuffer(self.device, framebuffer, null);
@@ -994,10 +1132,22 @@ const HelloTriangleApplication = struct {
         self.allocator.free(self.swapChainImages);
         self.allocator.free(self.swapChainImageViews);
         c.vkDestroySwapchainKHR(self.device, self.swapChain, null);
+
+        var i: u32 = 0;
+        while (i < self.uniformBuffers.len) : (i += 1) {
+            c.vkDestroyBuffer(self.device, self.uniformBuffers[i], null);
+            c.vkFreeMemory(self.device, self.uniformBuffersMemory[i], null);
+        }
+        self.allocator.free(self.uniformBuffers);
+        self.allocator.free(self.uniformBuffersMemory);
+        c.vkDestroyDescriptorPool(self.device, self.descriptorPool, null);
+        self.allocator.free(self.descriptorSets);
     }
 
     fn cleanup(self: *HelloTriangleApplication) void {
         self.cleanupSwapChain();
+
+        c.vkDestroyDescriptorSetLayout(self.device, self.descriptorSetLayout, null);
 
         c.vkDestroyBuffer(self.device, self.vertexBuffer, null);
         c.vkFreeMemory(self.device, self.vertexBufferMemory, null);
@@ -1112,9 +1262,11 @@ fn checkDeviceExtensionSupport(allocator: *std.mem.Allocator, device: c.VkPhysic
 
 pub fn main() anyerror!void {
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    const timer = try std.time.Timer.start();
     defer _ = gpa.deinit();
     var app = HelloTriangleApplication {
         .allocator = &gpa.allocator,
+        .timer = timer,
     };
     try app.run();
     std.log.info("Reached program end!", .{});
