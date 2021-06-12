@@ -1,5 +1,7 @@
 const std = @import("std");
-const shader_utils = @import("shader_utils.zig");
+const shader_utils = @import("./shader_utils.zig");
+
+const zimg = @import("zigimg");
 
 const zug = @import("zug.zig");
 const Vec2 = zug.Vec2(f32);
@@ -39,6 +41,12 @@ const VulkanError = error {
     DescriptorSetLayoutCreateFail,
     DescriptorPoolCreateFail,
     DescriptorSetAllocateFail,
+    ImageCreateFail,
+    ImageMemoryAllocateFail,
+};
+
+const OtherError = error {
+    UnsupportedLayoutTransition,
 };
 
 const AllocError = std.mem.Allocator.Error;
@@ -226,6 +234,9 @@ const HelloTriangleApplication = struct {
     uniformBuffers: []c.VkBuffer = undefined,
     uniformBuffersMemory: []c.VkDeviceMemory = undefined,
 
+    textureImage: c.VkImage = undefined,
+    textureImageMemory: c.VkDeviceMemory = undefined,
+
     pub fn run(self: *HelloTriangleApplication) !void {
         self.initWindow();
         try self.initVulkan();
@@ -265,6 +276,7 @@ const HelloTriangleApplication = struct {
         try self.createGraphicsPipeline();
         try self.createFramebuffers();
         try self.createCommandPool();
+        try self.createTextureImage();
         try self.createVertexBuffer();
         try self.createIndexBuffer();
         try self.createUniformBuffers();
@@ -272,6 +284,191 @@ const HelloTriangleApplication = struct {
         try self.createDescriptorSets();
         try self.createCommandBuffers();
         try self.createSyncObjects();
+    }
+
+    fn copyBufferToImage(self: *HelloTriangleApplication, buffer: c.VkBuffer, image: c.VkImage, width: u32, height: u32) void {
+        const commandBuffer = self.beginSingleTimeCommands();
+
+        const region = c.VkBufferImageCopy {
+            .bufferOffset = 0,
+            .bufferRowLength = 0,
+            .bufferImageHeight = 0,
+            .imageSubresource = c.VkImageSubresourceLayers {
+                .aspectMask = c.VK_IMAGE_ASPECT_COLOR_BIT,
+                .mipLevel = 0,
+                .baseArrayLayer = 0,
+                .layerCount = 1,
+            },
+            .imageOffset = c.VkOffset3D { .x = 0, .y = 0, .z = 0 },
+            .imageExtent = c.VkExtent3D {
+                .width = width,
+                .height = height,
+                .depth = 1,
+            },
+        };
+
+        c.vkCmdCopyBufferToImage(commandBuffer, buffer, image, c.VkImageLayout.VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &region);
+
+        self.endSingleTimeCommands(commandBuffer);
+    }
+
+    fn transitionImageLayout(self: *HelloTriangleApplication, image: c.VkImage, format: c.VkFormat, oldLayout: c.VkImageLayout, newLayout: c.VkImageLayout) OtherError!void {
+        const commandBuffer = self.beginSingleTimeCommands();
+
+        var barrier = c.VkImageMemoryBarrier {
+            .sType = c.VkStructureType.VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
+            .oldLayout = oldLayout,
+            .newLayout = newLayout,
+            .srcQueueFamilyIndex = c.VK_QUEUE_FAMILY_IGNORED,
+            .dstQueueFamilyIndex = c.VK_QUEUE_FAMILY_IGNORED,
+            .image = image,
+            .subresourceRange = c.VkImageSubresourceRange {
+                .aspectMask = c.VK_IMAGE_ASPECT_COLOR_BIT,
+                .baseMipLevel = 0,
+                .levelCount = 1,
+                .baseArrayLayer = 0,
+                .layerCount = 1,
+            },
+            .srcAccessMask = 0,
+            .dstAccessMask = 0,
+            .pNext = null,
+        };
+
+        var srcStage: c.VkPipelineStageFlags = undefined;
+        var dstStage: c.VkPipelineStageFlags = undefined;
+
+        if (oldLayout == c.VkImageLayout.VK_IMAGE_LAYOUT_UNDEFINED and newLayout == c.VkImageLayout.VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL) {
+            barrier.srcAccessMask = 0;
+            barrier.dstAccessMask = c.VK_ACCESS_TRANSFER_WRITE_BIT;
+
+            srcStage = c.VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT;
+            dstStage = c.VK_PIPELINE_STAGE_TRANSFER_BIT;
+        } else if (oldLayout == c.VkImageLayout.VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL and newLayout == c.VkImageLayout.VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL) {
+            barrier.srcAccessMask = c.VK_ACCESS_TRANSFER_WRITE_BIT;
+            barrier.dstAccessMask = c.VK_ACCESS_SHADER_READ_BIT;
+
+            srcStage = c.VK_PIPELINE_STAGE_TRANSFER_BIT;
+            dstStage = c.VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT;
+        } else {
+            return OtherError.UnsupportedLayoutTransition;
+        }
+
+        c.vkCmdPipelineBarrier(commandBuffer, srcStage, dstStage, 0, 0, null, 0, null, 1, &barrier);
+
+        self.endSingleTimeCommands(commandBuffer);
+    }
+
+    fn beginSingleTimeCommands(self: *HelloTriangleApplication) c.VkCommandBuffer {
+        const allocInfo = c.VkCommandBufferAllocateInfo {
+            .sType = c.VkStructureType.VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO,
+            .level = c.VkCommandBufferLevel.VK_COMMAND_BUFFER_LEVEL_PRIMARY,
+            .commandPool = self.commandPool,
+            .commandBufferCount = 1,
+            .pNext = null,
+        };
+
+        var commandBuffer: c.VkCommandBuffer = undefined;
+        _ = c.vkAllocateCommandBuffers(self.device, &allocInfo, &commandBuffer);
+
+        const beginInfo = c.VkCommandBufferBeginInfo {
+            .sType = c.VkStructureType.VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
+            .flags = c.VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT,
+            .pInheritanceInfo = null,
+            .pNext = null,
+        };
+
+        _ = c.vkBeginCommandBuffer(commandBuffer, &beginInfo);
+
+        return commandBuffer;
+    }
+
+    fn endSingleTimeCommands(self: *HelloTriangleApplication, commandBuffer: c.VkCommandBuffer) void {
+        _ = c.vkEndCommandBuffer(commandBuffer);
+
+        const submitInfo = c.VkSubmitInfo {
+            .sType = c.VkStructureType.VK_STRUCTURE_TYPE_SUBMIT_INFO,
+            .commandBufferCount = 1,
+            .pCommandBuffers = &commandBuffer,
+            .waitSemaphoreCount = 0,
+            .pWaitSemaphores = null,
+            .signalSemaphoreCount = 0,
+            .pSignalSemaphores = null,
+            .pWaitDstStageMask = null,
+            .pNext = null,
+        };
+
+        _ = c.vkQueueSubmit(self.graphicsQueue, 1, &submitInfo, null);
+        _ = c.vkQueueWaitIdle(self.graphicsQueue);
+
+        c.vkFreeCommandBuffers(self.device, self.commandPool, 1, &commandBuffer);
+    }
+
+    fn createTextureImage(self: *HelloTriangleApplication) !void {
+        const image = try zimg.Image.fromFilePath(self.allocator, "./textures/texture.png");
+        defer image.deinit();
+        const imageSize: c.VkDeviceSize = image.width * image.height * 16;
+
+        var stagingBuffer: c.VkBuffer = undefined;
+        var stagingBufferMemory: c.VkDeviceMemory = undefined;
+        try self.createBuffer(imageSize, c.VK_BUFFER_USAGE_TRANSFER_SRC_BIT, c.VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | c.VK_MEMORY_PROPERTY_HOST_COHERENT_BIT, &stagingBuffer, &stagingBufferMemory);
+
+        var data: ?*c_void = undefined;
+        _ = c.vkMapMemory(self.device, stagingBufferMemory, 0, imageSize, 0, &data);
+        var iterator = zimg.color.ColorStorageIterator.init(&image.pixels.?);
+        for (@ptrCast([*]zimg.color.Color, @alignCast(4, data))[0..image.width * image.height]) |*pixel, i| {
+            pixel.* = iterator.next().?;
+        }
+        c.vkUnmapMemory(self.device, stagingBufferMemory);
+
+        try self.createImage(@intCast(u32, image.width), @intCast(u32, image.height), c.VkFormat.VK_FORMAT_R32G32B32A32_SFLOAT, c.VkImageTiling.VK_IMAGE_TILING_OPTIMAL, c.VK_IMAGE_USAGE_TRANSFER_DST_BIT | c.VK_IMAGE_USAGE_SAMPLED_BIT, c.VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, &self.textureImage, &self.textureImageMemory);
+
+        try self.transitionImageLayout(self.textureImage, c.VkFormat.VK_FORMAT_R32G32B32A32_SFLOAT, c.VkImageLayout.VK_IMAGE_LAYOUT_UNDEFINED, c.VkImageLayout.VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
+        self.copyBufferToImage(stagingBuffer, self.textureImage, @intCast(u32, image.width), @intCast(u32, image.height));
+        try self.transitionImageLayout(self.textureImage, c.VkFormat.VK_FORMAT_R32G32B32A32_SFLOAT, c.VkImageLayout.VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, c.VkImageLayout.VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+
+        c.vkDestroyBuffer(self.device, stagingBuffer, null);
+        c.vkFreeMemory(self.device, stagingBufferMemory, null);
+    }
+
+    fn createImage(self: *HelloTriangleApplication, width: u32, height: u32, format: c.VkFormat, tiling: c.VkImageTiling, usage: c.VkImageUsageFlags, properties: c.VkMemoryPropertyFlags, image: *c.VkImage, imageMemory: *c.VkDeviceMemory) VulkanError!void {
+        const imageInfo = c.VkImageCreateInfo {
+            .sType = c.VkStructureType.VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO,
+            .imageType = c.VkImageType.VK_IMAGE_TYPE_2D,
+            .extent = c.VkExtent3D {
+                .width = width,
+                .height = height,
+                .depth = 1,
+            },
+            .mipLevels = 1,
+            .arrayLayers = 1,
+            .format = format,
+            .tiling = tiling,
+            .initialLayout = c.VkImageLayout.VK_IMAGE_LAYOUT_UNDEFINED,
+            .usage = usage,
+            .sharingMode = c.VkSharingMode.VK_SHARING_MODE_EXCLUSIVE,
+            .samples = c.VkSampleCountFlagBits.VK_SAMPLE_COUNT_1_BIT,
+            .flags = 0,
+            .pNext = null,
+            .queueFamilyIndexCount = 0,
+            .pQueueFamilyIndices = null,
+        };
+
+        if (c.vkCreateImage(self.device, &imageInfo, null, &self.textureImage) != c.VkResult.VK_SUCCESS) return VulkanError.ImageCreateFail;
+
+
+        var memRequirements: c.VkMemoryRequirements = undefined;
+        c.vkGetImageMemoryRequirements(self.device, self.textureImage, &memRequirements);
+
+        const allocInfo = c.VkMemoryAllocateInfo {
+            .sType = c.VkStructureType.VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
+            .allocationSize = memRequirements.size,
+            .memoryTypeIndex = try self.findMemoryType(memRequirements.memoryTypeBits, c.VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT),
+            .pNext = null,
+        };
+
+        if (c.vkAllocateMemory(self.device, &allocInfo, null, &self.textureImageMemory) != c.VkResult.VK_SUCCESS) return VulkanError.ImageMemoryAllocateFail;
+
+        _ = c.vkBindImageMemory(self.device, self.textureImage, self.textureImageMemory, 0);
     }
 
     fn createDescriptorSets(self: *HelloTriangleApplication) (AllocError || VulkanError)!void {
@@ -437,51 +634,16 @@ const HelloTriangleApplication = struct {
     }
 
     fn copyBuffer(self: *HelloTriangleApplication, srcBuffer: c.VkBuffer, dstBuffer: c.VkBuffer, size: c.VkDeviceSize) void {
-        const allocInfo = c.VkCommandBufferAllocateInfo {
-            .sType = c.VkStructureType.VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO,
-            .level = c.VkCommandBufferLevel.VK_COMMAND_BUFFER_LEVEL_PRIMARY,
-            .commandPool = self.commandPool,
-            .commandBufferCount = 1,
-            .pNext = null,
-        };
-
-        var commandBuffer: c.VkCommandBuffer = undefined;
-        _ = c.vkAllocateCommandBuffers(self.device, &allocInfo, &commandBuffer);
-
-        const beginInfo = c.VkCommandBufferBeginInfo {
-            .sType = c.VkStructureType.VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
-            .flags = c.VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT,
-            .pInheritanceInfo = null,
-            .pNext = null,
-        };
-
-        _ = c.vkBeginCommandBuffer(commandBuffer, &beginInfo);
+        const commandBuffer = self.beginSingleTimeCommands();
 
         const copyRegion = c.VkBufferCopy {
             .srcOffset = 0,
             .dstOffset = 0,
             .size = size,
         };
-
         c.vkCmdCopyBuffer(commandBuffer, srcBuffer, dstBuffer, 1, &copyRegion);
-        _ = c.vkEndCommandBuffer(commandBuffer);
 
-        const submitInfo = c.VkSubmitInfo {
-            .sType = c.VkStructureType.VK_STRUCTURE_TYPE_SUBMIT_INFO,
-            .commandBufferCount = 1,
-            .pCommandBuffers = &commandBuffer,
-            .waitSemaphoreCount = 0,
-            .pWaitSemaphores = null,
-            .signalSemaphoreCount = 0,
-            .pSignalSemaphores = null,
-            .pWaitDstStageMask = null,
-            .pNext = null,
-        };
-
-        _ = c.vkQueueSubmit(self.graphicsQueue, 1, &submitInfo, null);
-        _ = c.vkQueueWaitIdle(self.graphicsQueue);
-
-        c.vkFreeCommandBuffers(self.device, self.commandPool, 1, &commandBuffer);
+        self.endSingleTimeCommands(commandBuffer);
     }
 
     fn findMemoryType(self: *HelloTriangleApplication, typeFilter: u32, properties: c.VkMemoryPropertyFlags) VulkanError!u32 {
@@ -1146,6 +1308,9 @@ const HelloTriangleApplication = struct {
 
     fn cleanup(self: *HelloTriangleApplication) void {
         self.cleanupSwapChain();
+
+        c.vkDestroyImage(self.device, self.textureImage, null);
+        c.vkFreeMemory(self.device, self.textureImageMemory, null);
 
         c.vkDestroyDescriptorSetLayout(self.device, self.descriptorSetLayout, null);
 

@@ -11,7 +11,7 @@ pub fn build(b: *std.build.Builder) void {
     // between Debug, ReleaseSafe, ReleaseFast, and ReleaseSmall.
     const mode = b.standardReleaseOptions();
 
-    const exe = b.addExecutable("ziglearn", "src/main.zig");
+    const exe = b.addExecutable("vulkan-tutorial-zig", "src/main.zig");
 
     exe.linkLibC();
     exe.linkSystemLibrary("glfw");
@@ -21,6 +21,8 @@ pub fn build(b: *std.build.Builder) void {
     exe.addLibPath("vendor/lib/shaderc");
     exe.linkSystemLibrary("shaderc_combined");
     exe.addIncludeDir("vendor/include/");
+
+    exe.addPackagePath("zigimg", "deps/zigimg/zigimg.zig");
 
     exe.setTarget(target);
     exe.setBuildMode(mode);
