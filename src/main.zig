@@ -43,10 +43,13 @@ const VulkanError = error {
     DescriptorSetAllocateFail,
     ImageCreateFail,
     ImageMemoryAllocateFail,
+    TextureImageViewCreateFail,
+    TextureSamplerCreateFail,
 };
 
 const OtherError = error {
     UnsupportedLayoutTransition,
+    SupportedFormatFindFail,
 };
 
 const AllocError = std.mem.Allocator.Error;
@@ -75,8 +78,9 @@ const ptrExtensions = comptime comp: {
 const enableValidationLayers = @import("builtin").mode == std.builtin.Mode.Debug;
 
 const Vertex = extern struct {
-    pos: Vec2,
+    pos: Vec3,
     color: Vec3,
+    texCoord: Vec2,
 
     fn getBindingDescription() c.VkVertexInputBindingDescription {
         const bindingDescription = c.VkVertexInputBindingDescription {
@@ -88,11 +92,11 @@ const Vertex = extern struct {
         return bindingDescription;
     }
 
-    fn getAttributeDescriptions() [2]c.VkVertexInputAttributeDescription {
+    fn getAttributeDescriptions() [@typeInfo(Vertex).Struct.fields.len]c.VkVertexInputAttributeDescription {
         const attributeDescriptionPos = c.VkVertexInputAttributeDescription {
             .binding = 0,
             .location = 0,
-            .format = c.VkFormat.VK_FORMAT_R32G32_SFLOAT,
+            .format = c.VkFormat.VK_FORMAT_R32G32B32_SFLOAT,
             .offset = @bitOffsetOf(Vertex, "pos"),
         };
 
@@ -103,15 +107,27 @@ const Vertex = extern struct {
             .offset = @byteOffsetOf(Vertex, "color"),
         };
 
-        return .{ attributeDescriptionPos, attributeDescriptionColor };
+        const attributeDescriptionTexCoord = c.VkVertexInputAttributeDescription {
+            .binding = 0,
+            .location = 2,
+            .format = c.VkFormat.VK_FORMAT_R32G32_SFLOAT,
+            .offset = @byteOffsetOf(Vertex, "texCoord"),
+        };
+
+        return .{ attributeDescriptionPos, attributeDescriptionColor, attributeDescriptionTexCoord };
     }
 };
 
 const vertices = [_]Vertex {
-    Vertex { .pos = Vec2.new(-0.5, -0.5), .color = Vec3.new(1.0, 0.0, 0.0) },
-    Vertex { .pos = Vec2.new(0.5, -0.5), .color = Vec3.new(0.0, 1.0, 0.0) },
-    Vertex { .pos = Vec2.new(0.5, 0.5), .color = Vec3.new(0.0, 0.0, 1.0) },
-    Vertex { .pos = Vec2.new(-0.5, 0.5), .color = Vec3.new(1.0, 1.0, 1.0) },
+    Vertex { .pos = Vec3.new(-0.5, -0.5, 0.0), .color = Vec3.new(1.0, 0.0, 0.0), .texCoord = Vec2.new(1.0, 0.0) },
+    Vertex { .pos = Vec3.new(0.5, -0.5, 0.0), .color = Vec3.new(0.0, 1.0, 0.0), .texCoord = Vec2.new(0.0, 0.0) },
+    Vertex { .pos = Vec3.new(0.5, 0.5, 0.0), .color = Vec3.new(0.0, 0.0, 1.0), .texCoord = Vec2.new(0.0, 1.0) },
+    Vertex { .pos = Vec3.new(-0.5, 0.5, 0.0), .color = Vec3.new(1.0, 1.0, 1.0), .texCoord = Vec2.new(1.0, 1.0) },
+
+    Vertex { .pos = Vec3.new(-0.5, -0.5, -0.5), .color = Vec3.new(1.0, 0.0, 0.0), .texCoord = Vec2.new(1.0, 0.0) },
+    Vertex { .pos = Vec3.new(0.5, -0.5, -0.5), .color = Vec3.new(0.0, 1.0, 0.0), .texCoord = Vec2.new(0.0, 0.0) },
+    Vertex { .pos = Vec3.new(0.5, 0.5, -0.5), .color = Vec3.new(0.0, 0.0, 1.0), .texCoord = Vec2.new(0.0, 1.0) },
+    Vertex { .pos = Vec3.new(-0.5, 0.5, -0.5), .color = Vec3.new(1.0, 1.0, 1.0), .texCoord = Vec2.new(1.0, 1.0) },
 };
 
 const UniformBufferObject = extern struct {
@@ -120,7 +136,10 @@ const UniformBufferObject = extern struct {
     proj: Mat4,
 };
 
-const indices = [_]u16{0, 1, 2, 2, 3, 0};
+const indices = [_]u16{
+    0, 1, 2, 2, 3, 0,
+    4, 5, 6, 6, 7, 4,
+};
 
 const SwapChainSupportDetails = struct {
     capabilities: c.VkSurfaceCapabilitiesKHR,
@@ -187,6 +206,10 @@ const QueueFamilyIndices = struct {
     }
 };
 
+fn hasStencilComponent(format: c.VkFormat) bool {
+    return format == c.VkFormat.VK_FORMAT_D32_SFLOAT_S8_UINT or format == c.VkFormat.VK_FORMAT_D24_UNORM_S8_UINT;
+}
+
 const HelloTriangleApplication = struct {
     allocator: *std.mem.Allocator,
     timer: std.time.Timer,
@@ -236,6 +259,12 @@ const HelloTriangleApplication = struct {
 
     textureImage: c.VkImage = undefined,
     textureImageMemory: c.VkDeviceMemory = undefined,
+    textureImageView: c.VkImageView = undefined,
+    textureSampler: c.VkSampler = undefined,
+
+    depthImage: c.VkImage = undefined,
+    depthImageMemory: c.VkDeviceMemory = undefined,
+    depthImageView: c.VkImageView = undefined,
 
     pub fn run(self: *HelloTriangleApplication) !void {
         self.initWindow();
@@ -274,9 +303,12 @@ const HelloTriangleApplication = struct {
         try self.createRenderPass();
         try self.createDescriptorSetLayout();
         try self.createGraphicsPipeline();
-        try self.createFramebuffers();
         try self.createCommandPool();
+        try self.createDepthResources();
+        try self.createFramebuffers();
         try self.createTextureImage();
+        try self.createTextureImageView();
+        try self.createTextureSampler();
         try self.createVertexBuffer();
         try self.createIndexBuffer();
         try self.createUniformBuffers();
@@ -284,6 +316,60 @@ const HelloTriangleApplication = struct {
         try self.createDescriptorSets();
         try self.createCommandBuffers();
         try self.createSyncObjects();
+    }
+
+    fn findDepthFormat(self: *HelloTriangleApplication) OtherError!c.VkFormat {
+        return self.findSupportedFormat(&[_]c.VkFormat{c.VkFormat.VK_FORMAT_D32_SFLOAT, c.VkFormat.VK_FORMAT_D32_SFLOAT_S8_UINT, c.VkFormat.VK_FORMAT_D24_UNORM_S8_UINT}, c.VkImageTiling.VK_IMAGE_TILING_OPTIMAL, c.VK_FORMAT_FEATURE_DEPTH_STENCIL_ATTACHMENT_BIT);
+    }
+
+    fn findSupportedFormat(self: *HelloTriangleApplication, candidates: []const c.VkFormat, tiling: c.VkImageTiling, features: c.VkFormatFeatureFlags) OtherError!c.VkFormat {
+        for (candidates) |format| {
+            var props: c.VkFormatProperties = undefined;
+            c.vkGetPhysicalDeviceFormatProperties(self.physicalDevice, format, &props);
+            if (
+                (tiling == c.VkImageTiling.VK_IMAGE_TILING_LINEAR and (props.linearTilingFeatures & features) == features) or
+                (tiling == c.VkImageTiling.VK_IMAGE_TILING_OPTIMAL and (props.optimalTilingFeatures & features) == features)
+                ) return format;
+        }
+        return OtherError.SupportedFormatFindFail;
+    }
+
+    fn createDepthResources(self: *HelloTriangleApplication) (OtherError || VulkanError)!void {
+        const depthFormat = try self.findDepthFormat();
+        try self.createImage(self.swapChainExtent.width, self.swapChainExtent.height, depthFormat, c.VkImageTiling.VK_IMAGE_TILING_OPTIMAL, c.VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT, c.VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, &self.depthImage, &self.depthImageMemory);
+        self.depthImageView = try self.createImageView(self.depthImage, depthFormat, c.VK_IMAGE_ASPECT_DEPTH_BIT);
+    }
+
+    fn createTextureSampler(self: *HelloTriangleApplication) VulkanError!void {
+        var properties: c.VkPhysicalDeviceProperties = undefined;
+        c.vkGetPhysicalDeviceProperties(self.physicalDevice, &properties);
+
+        const samplerInfo = c.VkSamplerCreateInfo {
+            .sType = c.VkStructureType.VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO,
+            .magFilter = c.VkFilter.VK_FILTER_LINEAR,
+            .minFilter = c.VkFilter.VK_FILTER_LINEAR,
+            .addressModeU = c.VkSamplerAddressMode.VK_SAMPLER_ADDRESS_MODE_REPEAT,
+            .addressModeV = c.VkSamplerAddressMode.VK_SAMPLER_ADDRESS_MODE_REPEAT,
+            .addressModeW = c.VkSamplerAddressMode.VK_SAMPLER_ADDRESS_MODE_REPEAT,
+            .anisotropyEnable = c.VK_TRUE,
+            .maxAnisotropy = properties.limits.maxSamplerAnisotropy,
+            .borderColor = c.VkBorderColor.VK_BORDER_COLOR_INT_OPAQUE_BLACK,
+            .unnormalizedCoordinates = c.VK_FALSE,
+            .compareEnable = c.VK_FALSE,
+            .compareOp = c.VkCompareOp.VK_COMPARE_OP_ALWAYS,
+            .mipmapMode = c.VkSamplerMipmapMode.VK_SAMPLER_MIPMAP_MODE_LINEAR,
+            .mipLodBias = 0.0,
+            .minLod = 0.0,
+            .maxLod = 0.0,
+            .pNext = null,
+            .flags = 0,
+        };
+
+        if (c.vkCreateSampler(self.device, &samplerInfo, null, &self.textureSampler) != c.VkResult.VK_SUCCESS) return VulkanError.TextureSamplerCreateFail;
+    }
+
+    fn createTextureImageView(self: *HelloTriangleApplication) VulkanError!void {
+        self.textureImageView = try self.createImageView(self.textureImage, c.VkFormat.VK_FORMAT_R32G32B32A32_SFLOAT, c.VK_IMAGE_ASPECT_COLOR_BIT);
     }
 
     fn copyBufferToImage(self: *HelloTriangleApplication, buffer: c.VkBuffer, image: c.VkImage, width: u32, height: u32) void {
@@ -453,11 +539,11 @@ const HelloTriangleApplication = struct {
             .pQueueFamilyIndices = null,
         };
 
-        if (c.vkCreateImage(self.device, &imageInfo, null, &self.textureImage) != c.VkResult.VK_SUCCESS) return VulkanError.ImageCreateFail;
+        if (c.vkCreateImage(self.device, &imageInfo, null, image) != c.VkResult.VK_SUCCESS) return VulkanError.ImageCreateFail;
 
 
         var memRequirements: c.VkMemoryRequirements = undefined;
-        c.vkGetImageMemoryRequirements(self.device, self.textureImage, &memRequirements);
+        c.vkGetImageMemoryRequirements(self.device, image.*, &memRequirements);
 
         const allocInfo = c.VkMemoryAllocateInfo {
             .sType = c.VkStructureType.VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
@@ -466,9 +552,9 @@ const HelloTriangleApplication = struct {
             .pNext = null,
         };
 
-        if (c.vkAllocateMemory(self.device, &allocInfo, null, &self.textureImageMemory) != c.VkResult.VK_SUCCESS) return VulkanError.ImageMemoryAllocateFail;
+        if (c.vkAllocateMemory(self.device, &allocInfo, null, imageMemory) != c.VkResult.VK_SUCCESS) return VulkanError.ImageMemoryAllocateFail;
 
-        _ = c.vkBindImageMemory(self.device, self.textureImage, self.textureImageMemory, 0);
+        _ = c.vkBindImageMemory(self.device, image.*, imageMemory.*, 0);
     }
 
     fn createDescriptorSets(self: *HelloTriangleApplication) (AllocError || VulkanError)!void {
@@ -497,7 +583,13 @@ const HelloTriangleApplication = struct {
                 .range = @sizeOf(UniformBufferObject),
             };
 
-            const descriptorWrite = c.VkWriteDescriptorSet {
+            const imageInfo = c.VkDescriptorImageInfo {
+                .imageLayout = c.VkImageLayout.VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+                .imageView = self.textureImageView,
+                .sampler = self.textureSampler, 
+            };
+
+            const descriptorWriteUniform = c.VkWriteDescriptorSet {
                 .sType = c.VkStructureType.VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
                 .dstSet = self.descriptorSets[i],
                 .dstBinding = 0,
@@ -510,20 +602,42 @@ const HelloTriangleApplication = struct {
                 .pNext = null,
             };
 
-            c.vkUpdateDescriptorSets(self.device, 1, &descriptorWrite, 0, null);
+            const descriptorWriteSampler = c.VkWriteDescriptorSet {
+                .sType = c.VkStructureType.VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
+                .dstSet = self.descriptorSets[i],
+                .dstBinding = 1,
+                .dstArrayElement = 0,
+                .descriptorType = c.VkDescriptorType.VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
+                .descriptorCount = 1,
+                .pBufferInfo = null,
+                .pImageInfo = &imageInfo,
+                .pTexelBufferView = null,
+                .pNext = null,
+            };
+
+            const descriptorWrites = [_]c.VkWriteDescriptorSet { descriptorWriteUniform, descriptorWriteSampler };
+
+            c.vkUpdateDescriptorSets(self.device, descriptorWrites.len, &descriptorWrites, 0, null);
         }
     }
 
     fn createDescriptorPool(self: *HelloTriangleApplication) VulkanError!void {
-        const poolSize = c.VkDescriptorPoolSize {
+        const poolSizeUniform = c.VkDescriptorPoolSize {
             .type = c.VkDescriptorType.VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,
             .descriptorCount = @intCast(u32, self.swapChainImages.len),
         };
 
+        const poolSizeSampler = c.VkDescriptorPoolSize {
+            .type = c.VkDescriptorType.VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
+            .descriptorCount = @intCast(u32, self.swapChainImages.len),
+        };
+
+        const poolSizes = [_]c.VkDescriptorPoolSize { poolSizeUniform, poolSizeSampler };
+
         const poolInfo = c.VkDescriptorPoolCreateInfo {
             .sType = c.VkStructureType.VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO,
-            .poolSizeCount = 1,
-            .pPoolSizes = &poolSize,
+            .poolSizeCount = poolSizes.len,
+            .pPoolSizes = &poolSizes,
             .maxSets = @intCast(u32, self.swapChainImages.len),
             .pNext = null,
             .flags = 0,
@@ -554,10 +668,20 @@ const HelloTriangleApplication = struct {
             .pImmutableSamplers = null,
         };
 
+        const samplerLayoutBinding = c.VkDescriptorSetLayoutBinding {
+            .binding = 1,
+            .descriptorCount = 1,
+            .descriptorType = c.VkDescriptorType.VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
+            .stageFlags = c.VK_SHADER_STAGE_FRAGMENT_BIT,
+            .pImmutableSamplers = null,
+        };
+
+        const bindings = [_]c.VkDescriptorSetLayoutBinding{ uboLayoutBinding, samplerLayoutBinding };
+
         const layoutInfo = c.VkDescriptorSetLayoutCreateInfo {
             .sType = c.VkStructureType.VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO,
-            .bindingCount = 1,
-            .pBindings = &uboLayoutBinding,
+            .bindingCount = bindings.len,
+            .pBindings = &bindings,
             .pNext = null,
             .flags = 0,
         };
@@ -660,7 +784,7 @@ const HelloTriangleApplication = struct {
         return VulkanError.MemoryTypeFindFail;
     }
 
-    fn recreateSwapChain(self: *HelloTriangleApplication) (VulkanError || AllocError || shader_utils.CompilationError)!void {
+    fn recreateSwapChain(self: *HelloTriangleApplication) (VulkanError || AllocError || shader_utils.CompilationError || OtherError)!void {
         var width: c_int = 0;
         var height: c_int = 0;
         c.glfwGetFramebufferSize(self.window, &width, &height);
@@ -676,6 +800,7 @@ const HelloTriangleApplication = struct {
         try self.createImageViews();
         try self.createRenderPass();
         try self.createGraphicsPipeline();
+        try self.createDepthResources();
         try self.createFramebuffers();
         try self.createUniformBuffers();
         try self.createDescriptorPool();
@@ -724,6 +849,11 @@ const HelloTriangleApplication = struct {
             };
             if (c.vkBeginCommandBuffer(commandBuffer, &beginInfo) != c.VkResult.VK_SUCCESS) return VulkanError.CommandBufferRecordFail;
 
+            const clearValues = [_]c.VkClearValue {
+                c.VkClearValue { .color = c.VkClearColorValue { .float32 = [_]f32{ 0.0, 0.0, 0.0, 1.0 } } },
+                c.VkClearValue { .depthStencil = c.VkClearDepthStencilValue { .depth = 1.0, .stencil = 0 } },
+            };
+
             const renderPassInfo = c.VkRenderPassBeginInfo {
                 .sType = c.VkStructureType.VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO,
                 .renderPass = self.renderPass,
@@ -732,8 +862,8 @@ const HelloTriangleApplication = struct {
                     .offset = c.VkOffset2D { .x = 0, .y = 0 },
                     .extent = self.swapChainExtent,
                 },
-                .clearValueCount = 1,
-                .pClearValues = &c.VkClearValue { .color = c.VkClearColorValue { .float32 = [_]f32{ 0.0, 0.0, 0.0, 1.0 } } },
+                .clearValueCount = clearValues.len,
+                .pClearValues = &clearValues,
                 .pNext = null,
             };
             c.vkCmdBeginRenderPass(commandBuffer, &renderPassInfo, c.VkSubpassContents.VK_SUBPASS_CONTENTS_INLINE);
@@ -767,11 +897,12 @@ const HelloTriangleApplication = struct {
     fn createFramebuffers(self: *HelloTriangleApplication) (AllocError || VulkanError)!void {
         self.swapChainFramebuffers = try self.allocator.alloc(c.VkFramebuffer, self.swapChainImageViews.len);
         for (self.swapChainImageViews) |imageView, i| {
+            const attachments = [_]c.VkImageView { imageView, self.depthImageView };
             const framebufferInfo = c.VkFramebufferCreateInfo {
                 .sType = c.VkStructureType.VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO,
                 .renderPass = self.renderPass,
-                .attachmentCount = 1,
-                .pAttachments = &imageView,
+                .attachmentCount = attachments.len,
+                .pAttachments = &attachments,
                 .width = self.swapChainExtent.width,
                 .height = self.swapChainExtent.height,
                 .layers = 1,
@@ -782,7 +913,7 @@ const HelloTriangleApplication = struct {
         }
     }
 
-    fn createRenderPass(self: *HelloTriangleApplication) VulkanError!void {
+    fn createRenderPass(self: *HelloTriangleApplication) (OtherError || VulkanError)!void {
         const colorAttachment = c.VkAttachmentDescription {
             .format = self.swapChainImageFormat,
             .samples = c.VkSampleCountFlagBits.VK_SAMPLE_COUNT_1_BIT,
@@ -798,6 +929,23 @@ const HelloTriangleApplication = struct {
             .attachment = 0,
             .layout = c.VkImageLayout.VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
         };
+
+        const depthAttachment = c.VkAttachmentDescription {
+            .format = try self.findDepthFormat(),
+            .samples = c.VkSampleCountFlagBits.VK_SAMPLE_COUNT_1_BIT,
+            .loadOp = c.VkAttachmentLoadOp.VK_ATTACHMENT_LOAD_OP_CLEAR,
+            .storeOp = c.VkAttachmentStoreOp.VK_ATTACHMENT_STORE_OP_DONT_CARE,
+            .stencilLoadOp = c.VkAttachmentLoadOp.VK_ATTACHMENT_LOAD_OP_DONT_CARE,
+            .stencilStoreOp = c.VkAttachmentStoreOp.VK_ATTACHMENT_STORE_OP_DONT_CARE,
+            .initialLayout = c.VkImageLayout.VK_IMAGE_LAYOUT_UNDEFINED,
+            .finalLayout = c.VkImageLayout.VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL,
+            .flags = 0,
+        };
+        const depthAttachmentRef = c.VkAttachmentReference {
+            .attachment = 1,
+            .layout = c.VkImageLayout.VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL,
+        };
+
         const subpass = c.VkSubpassDescription {
             .pipelineBindPoint = c.VkPipelineBindPoint.VK_PIPELINE_BIND_POINT_GRAPHICS,
             .colorAttachmentCount = 1,
@@ -805,7 +953,7 @@ const HelloTriangleApplication = struct {
             .pResolveAttachments = null,
             .inputAttachmentCount = 0,
             .pInputAttachments = null,
-            .pDepthStencilAttachment = null,
+            .pDepthStencilAttachment = &depthAttachmentRef,
             .preserveAttachmentCount = 0,
             .pPreserveAttachments = null,
             .flags = 0,
@@ -813,16 +961,18 @@ const HelloTriangleApplication = struct {
         const dependency = c.VkSubpassDependency {
             .srcSubpass = c.VK_SUBPASS_EXTERNAL,
             .dstSubpass = 0,
-            .srcStageMask = c.VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
+            .srcStageMask = c.VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT | c.VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT,
             .srcAccessMask = 0,
-            .dstStageMask = c.VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
-            .dstAccessMask = c.VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
+            .dstStageMask = c.VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT | c.VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT,
+            .dstAccessMask = c.VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT | c.VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT,
             .dependencyFlags = 0,
         };
+
+        const attachments = [_]c.VkAttachmentDescription { colorAttachment, depthAttachment };
         const renderPassInfo = c.VkRenderPassCreateInfo {
             .sType = c.VkStructureType.VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO,
-            .attachmentCount = 1,
-            .pAttachments = &colorAttachment,
+            .attachmentCount = attachments.len,
+            .pAttachments = &attachments,
             .subpassCount = 1,
             .pSubpasses = &subpass,
             .dependencyCount = 1,
@@ -951,6 +1101,20 @@ const HelloTriangleApplication = struct {
             .pNext = null,
             .flags = 0,
         };
+        const depthStencil = c.VkPipelineDepthStencilStateCreateInfo {
+            .sType = c.VkStructureType.VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO,
+            .depthTestEnable = c.VK_TRUE,
+            .depthWriteEnable = c.VK_TRUE,
+            .depthCompareOp = c.VkCompareOp.VK_COMPARE_OP_LESS,
+            .depthBoundsTestEnable = c.VK_FALSE,
+            .minDepthBounds = 0.0,
+            .maxDepthBounds = 1.0,
+            .stencilTestEnable = c.VK_FALSE,
+            .front = undefined,
+            .back = undefined,
+            .pNext = null,
+            .flags = 0,
+        };
         const pipelineLayoutInfo = c.VkPipelineLayoutCreateInfo {
             .sType = c.VkStructureType.VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO,
             .setLayoutCount = 1,
@@ -970,7 +1134,7 @@ const HelloTriangleApplication = struct {
             .pViewportState = &viewportState,
             .pRasterizationState = &rasterizer,
             .pMultisampleState = &multisampling,
-            .pDepthStencilState = null,
+            .pDepthStencilState = &depthStencil,
             .pColorBlendState = &colorBlending,
             .pDynamicState = null,
             .layout = self.pipelineLayout,
@@ -998,31 +1162,37 @@ const HelloTriangleApplication = struct {
         return shaderModule;
     }
 
+    fn createImageView(self: *HelloTriangleApplication, image: c.VkImage, format: c.VkFormat, aspectFlags: c.VkImageAspectFlags) VulkanError!c.VkImageView {
+        const createInfo = c.VkImageViewCreateInfo {
+            .sType = c.VkStructureType.VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO,
+            .image = image,
+            .viewType = c.VkImageViewType.VK_IMAGE_VIEW_TYPE_2D,
+            .format = format,
+            .components = c.VkComponentMapping {
+                .r = c.VkComponentSwizzle.VK_COMPONENT_SWIZZLE_IDENTITY,
+                .g = c.VkComponentSwizzle.VK_COMPONENT_SWIZZLE_IDENTITY,
+                .b = c.VkComponentSwizzle.VK_COMPONENT_SWIZZLE_IDENTITY,
+                .a = c.VkComponentSwizzle.VK_COMPONENT_SWIZZLE_IDENTITY,
+            },
+            .subresourceRange = c.VkImageSubresourceRange {
+                .aspectMask = aspectFlags,
+                .baseMipLevel = 0,
+                .levelCount = 1,
+                .baseArrayLayer = 0,
+                .layerCount = 1,
+            },
+            .pNext = null,
+            .flags = 0,
+        };
+        var imageView: c.VkImageView = undefined;
+        if (c.vkCreateImageView(self.device, &createInfo, null, &imageView) != c.VkResult.VK_SUCCESS) return VulkanError.ImageViewCreateFail;
+        return imageView;
+    }
+
     fn createImageViews(self: *HelloTriangleApplication) !void {
         self.swapChainImageViews = try self.allocator.alloc(c.VkImageView, self.swapChainImages.len);
         for (self.swapChainImages) |swapChainImage, i| {
-            const createInfo = c.VkImageViewCreateInfo {
-                .sType = c.VkStructureType.VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO,
-                .image = swapChainImage,
-                .viewType = c.VkImageViewType.VK_IMAGE_VIEW_TYPE_2D,
-                .format = self.swapChainImageFormat,
-                .components = c.VkComponentMapping {
-                    .r = c.VkComponentSwizzle.VK_COMPONENT_SWIZZLE_IDENTITY,
-                    .g = c.VkComponentSwizzle.VK_COMPONENT_SWIZZLE_IDENTITY,
-                    .b = c.VkComponentSwizzle.VK_COMPONENT_SWIZZLE_IDENTITY,
-                    .a = c.VkComponentSwizzle.VK_COMPONENT_SWIZZLE_IDENTITY,
-                },
-                .subresourceRange = c.VkImageSubresourceRange {
-                    .aspectMask = c.VK_IMAGE_ASPECT_COLOR_BIT,
-                    .baseMipLevel = 0,
-                    .levelCount = 1,
-                    .baseArrayLayer = 0,
-                    .layerCount = 1,
-                },
-                .pNext = null,
-                .flags = 0,
-            };
-            if (c.vkCreateImageView(self.device, &createInfo, null, &self.swapChainImageViews[i]) != c.VkResult.VK_SUCCESS) return VulkanError.ImageViewCreateFail;
+            self.swapChainImageViews[i] = try self.createImageView(swapChainImage, self.swapChainImageFormat, c.VK_IMAGE_ASPECT_COLOR_BIT);
         }
     }
 
@@ -1117,7 +1287,7 @@ const HelloTriangleApplication = struct {
             .largePoints = 0,
             .alphaToOne = 0,
             .multiViewport = 0,
-            .samplerAnisotropy = 0,
+            .samplerAnisotropy = c.VK_TRUE,
             .textureCompressionETC2 = 0,
             .textureCompressionASTC_LDR = 0,
             .textureCompressionBC = 0,
@@ -1197,7 +1367,7 @@ const HelloTriangleApplication = struct {
         if (c.vkCreateInstance(&createInfo, null, &self.instance) != c.VkResult.VK_SUCCESS) return VulkanError.InstanceCreateError;
     }
 
-    fn mainLoop(self: *HelloTriangleApplication) (VulkanError || AllocError || shader_utils.CompilationError)!void {
+    fn mainLoop(self: *HelloTriangleApplication) (VulkanError || AllocError || shader_utils.CompilationError || OtherError)!void {
         while (c.glfwWindowShouldClose(self.window) == 0) {
             c.glfwPollEvents();
             try self.drawFrame();
@@ -1205,7 +1375,7 @@ const HelloTriangleApplication = struct {
         _ = c.vkDeviceWaitIdle(self.device);
     }
 
-    fn drawFrame(self: *HelloTriangleApplication) (VulkanError || AllocError || shader_utils.CompilationError)!void {
+    fn drawFrame(self: *HelloTriangleApplication) (VulkanError || AllocError || shader_utils.CompilationError || OtherError)!void {
         _ = c.vkWaitForFences(self.device, 1, &self.inFlightFences[self.currentFrame], c.VK_TRUE, std.math.maxInt(u64));
         var imageIndex: u32 = undefined;
         var result = c.vkAcquireNextImageKHR(self.device, self.swapChain, std.math.maxInt(u64), self.imageAvailableSemaphores[self.currentFrame], null, &imageIndex);
@@ -1275,6 +1445,10 @@ const HelloTriangleApplication = struct {
     }
 
     fn cleanupSwapChain(self: *HelloTriangleApplication) void {
+        c.vkDestroyImageView(self.device, self.depthImageView, null);
+        c.vkDestroyImage(self.device, self.depthImage, null);
+        c.vkFreeMemory(self.device, self.depthImageMemory, null);
+
         for (self.swapChainFramebuffers) |framebuffer| {
             c.vkDestroyFramebuffer(self.device, framebuffer, null);
         }
@@ -1309,6 +1483,8 @@ const HelloTriangleApplication = struct {
     fn cleanup(self: *HelloTriangleApplication) void {
         self.cleanupSwapChain();
 
+        c.vkDestroySampler(self.device, self.textureSampler, null);
+        c.vkDestroyImageView(self.device, self.textureImageView, null);
         c.vkDestroyImage(self.device, self.textureImage, null);
         c.vkFreeMemory(self.device, self.textureImageMemory, null);
 
@@ -1350,7 +1526,11 @@ const HelloTriangleApplication = struct {
             defer swapChainSupport.deinit(self.allocator);
             swapChainAdequate = swapChainSupport.formats.len != 0 and swapChainSupport.presentModes.len != 0;
         }
-        return indicesQ.isComplete() and extensionsSupported and swapChainAdequate;
+
+        var supportedFeatures: c.VkPhysicalDeviceFeatures = undefined;
+        c.vkGetPhysicalDeviceFeatures(device, &supportedFeatures);
+
+        return indicesQ.isComplete() and extensionsSupported and swapChainAdequate and supportedFeatures.samplerAnisotropy != 0;
     }
     fn chooseSwapSurfaceFormat(self: *HelloTriangleApplication, availableFormats: []const c.VkSurfaceFormatKHR) c.VkSurfaceFormatKHR {
         for (availableFormats) |availableFormat| {

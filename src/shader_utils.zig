@@ -29,7 +29,11 @@ pub fn glslStringToSPV(allocator: *std.mem.Allocator, glsl: []const u8) Error![]
     defer c.shaderc_result_release(result);
 
     const status = c.shaderc_result_get_compilation_status(result);
-    if (status != c.shaderc_compilation_status._success) return status_to_err(status);
+    if (status != c.shaderc_compilation_status._success) {
+        const message = c.shaderc_result_get_error_message(result);
+        std.log.warn("{s}", .{ message });
+        return status_to_err(status);
+    }
     const len = c.shaderc_result_get_length(result);
     const bytes = c.shaderc_result_get_bytes(result);
     const copied = try allocator.alloc(u8, len);
